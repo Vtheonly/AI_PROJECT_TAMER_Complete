@@ -643,6 +643,114 @@ class DatasetValidator:
             # We'd need to cross-reference samples here
             # This is a placeholder for future cross-dataset dedup
 
+    def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
+        """Pulls a previously verified and structured dataset directly from Hugging Face."""
+        try:
+            from datasets import load_dataset
+            logger.info(f"Pulling verified dataset from Hugging Face: {repo_id}...")
+            
+            dataset_dir = self.data_dir / dataset_name
+            img_dir = dataset_dir / "images"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Download from HF
+            config = self.registry.get_config(dataset_name)
+            hf_ds = load_dataset(repo_id, split="train", token=getattr(self.config, 'hf_token', None))
+            
+            valid_samples = []
+            logger.info(f"Extracting {len(hf_ds)} verified samples to disk...")
+            
+            for idx, item in enumerate(hf_ds):
+                img = item['image']
+                latex = item['latex']
+                
+                h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
+                img_path = img_dir / f"img_{idx}_{h}.png"
+                
+                if not img_path.exists():
+                    img.save(img_path)
+                
+                valid_samples.append({'image_path': str(img_path), 'latex': latex})
+                
+                if (idx + 1) % 10000 == 0:
+                    logger.info(f"  Saved {idx + 1}/{len(hf_ds)} images...")
+            
+            annot_file = dataset_dir / "annotations.json"
+            with open(annot_file, 'w', encoding='utf-8') as f:
+                json.dump(valid_samples, f, ensure_ascii=False, indent=2)
+                
+            logger.info(f"Successfully pulled and prepped verified dataset '{dataset_name}'")
+            
+            # Refresh validation state
+            self.result = ValidationResult()
+            self._validate_data_directory()
+            self._validate_single_dataset(dataset_name)
+            return self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
+            
+        except Exception as e:
+            logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
+            return False
+
+    def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
+        """Pushes a verified dataset to Hugging Face Hub for future fast access."""
+        if not getattr(self.config, 'hf_token', None):
+            logger.info("No hf_token provided. Skipping push of verified dataset.")
+            return
+            
+        try:
+            from datasets import Dataset, Image as HFImage
+            from huggingface_hub import HfApi, login
+            
+            annot_file = dataset_dir / "annotations.json"
+            if not annot_file.exists():
+                return
+                
+            with open(annot_file, 'r', encoding='utf-8') as f:
+                annotations = json.load(f)
+                
+            login(token=self.config.hf_token)
+            api = HfApi()
+            
+            # Dynamically get username so we push to the right account
+            username = api.whoami()['name']
+            base_repo = getattr(self.config, 'hf_dataset_repo', 'Verified-Datasets')
+            if '/' not in base_repo:
+                base_repo = f"{username}/{base_repo}"
+                
+            repo_id = f"{base_repo}-{dataset_name}"
+            
+            logger.info(f"Checking Hugging Face repository: {repo_id}")
+            
+            try:
+                api.repo_info(repo_id, repo_type="dataset")
+                logger.info(f"Repo {repo_id} already exists. Skipping push to avoid overwriting.")
+                return 
+            except Exception:
+                pass  # Repo doesn't exist, we will create it automatically by pushing!
+                
+            logger.info(f"Uploading verified dataset '{dataset_name}' to {repo_id}...")
+            
+            images = []
+            texts = []
+            for ann in annotations:
+                img_path = str(ann['image_path'])
+                if os.path.exists(img_path):
+                    images.append(img_path)
+                    texts.append(ann['latex'])
+                    
+            if not images:
+                logger.warning("No valid images found to push.")
+                return
+                
+            hf_ds = Dataset.from_dict({"image": images, "latex": texts}).cast_column("image", HFImage())
+            hf_ds.push_to_hub(repo_id, private=True, token=self.config.hf_token)
+            logger.info(f"Successfully pushed verified dataset '{dataset_name}' to HF Hub!")
+            
+        except ImportError:
+            logger.warning("Libraries 'datasets' or 'huggingface_hub' missing. Cannot push dataset.")
+        except Exception as e:
+            logger.error(f"Failed to push dataset to Hugging Face: {e}")
+
     def try_download_and_validate(self, dataset_name: str) -> bool:
         """
         Attempt to download a dataset and validate it.
@@ -652,6 +760,30 @@ class DatasetValidator:
         if not config:
             logger.error(f"Unknown dataset: {dataset_name}. Cannot download.")
             return False
+
+        # FAST PATH: Check if a verified dataset already exists on our Hugging Face Hub
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=getattr(self.config, 'hf_token', None))
+            
+            # Dynamically resolve username
+            username = api.whoami()['name']
+            base_repo = getattr(self.config, 'hf_dataset_repo', 'Verified-Datasets')
+            if '/' not in base_repo:
+                base_repo = f"{username}/{base_repo}"
+            repo_id = f"{base_repo}-{dataset_name}"
+            
+            if api.repo_exists(repo_id, repo_type="dataset"):
+                logger.info("=" * 60)
+                logger.info(f"TRUSTED SOURCE FOUND: {repo_id}")
+                logger.info("Bypassing raw download/parsing and pulling directly from HF Hub.")
+                logger.info("=" * 60)
+                success = self.pull_verified_dataset(dataset_name, repo_id)
+                if success:
+                    return True
+                logger.warning("Pull failed, falling back to raw download process...")
+        except Exception as e:
+            logger.debug(f"HF Hub check failed or repo doesn't exist: {e}")
 
         from .data_manager import DataManager
         dm = DataManager(self.config)
@@ -737,7 +869,14 @@ class DatasetValidator:
             self.result = ValidationResult()
             self._validate_data_directory()
             self._validate_single_dataset(dataset_name)
-            return self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
+            
+            is_ready = self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
+            
+            # PUSH TO VERIFIED REPO
+            if is_ready:
+                self.push_dataset_to_hf(dataset_name, dataset_dir)
+                
+            return is_ready
 
         except Exception as e:
             logger.error(f"Download/validation failed for {dataset_name}: {e}")
@@ -746,10 +885,9 @@ class DatasetValidator:
             return False
 
 
-def validate_before_training(config, force: bool = False) -> ValidationResult:
+def validate_datasets(config, force: bool = False) -> ValidationResult:
     """
-    GATEKEEPER FUNCTION: Validate ALL datasets before training.
-
+    Run dataset validation and enforce gatekeeping.
     This MUST pass before training can begin.
     Training WILL NOT START if this validation fails.
     

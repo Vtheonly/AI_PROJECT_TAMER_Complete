@@ -119,7 +119,7 @@ class DataManager:
         Stage 2: Clean handwritten data (MathWriting)
         
         Source: Hugging Face dataset
-        Returns: List of dicts with 'image' (PIL.Image) and 'latex' keys
+        Returns: List of dicts with 'image' (str path) and 'latex' keys
         """
         if self._stage2_cache is not None and not force_refresh:
             logger.info(f"Using cached Stage 2 data: {len(self._stage2_cache)} samples")
@@ -127,8 +127,17 @@ class DataManager:
             
         logger.info("Loading Stage 2: MathWriting (Clean Handwritten)")
         
-        # Note: HF datasets can't be cached to JSON (PIL Images),
-        # but we can cache metadata
+        # Check cache
+        cache_file = os.path.join(self.cache_dir, "stage2_mathwriting.json")
+        if not force_refresh and os.path.exists(cache_file):
+            try:
+                self._stage2_cache = self._load_cache(cache_file)
+                if isinstance(self._stage2_cache, list) and self._stage2_cache:
+                    logger.info(f"Loaded Stage 2 from cache: {len(self._stage2_cache)} samples")
+                    return self._stage2_cache
+            except Exception as e:
+                logger.warning(f"Cache load failed: {e}")
+
         try:
             hf_dataset = self.downloader.get_hf_dataset(
                 "deepcopy/MathWriting-human",
@@ -139,13 +148,13 @@ class DataManager:
                 self._stage2_cache = []
                 return []
                 
-            samples = self.parser.parse_mathwriting(hf_dataset)
+            extract_dir = os.path.join(self.data_dir, "mathwriting")
+            # Limit to 50k to prevent OOM/Disk limits, and save to disk to clear RAM
+            samples = self.parser.parse_mathwriting(hf_dataset, extract_dir=extract_dir, max_samples=50000)
             self._stage2_cache = samples
             
-            # Save metadata cache
-            meta_file = os.path.join(self.cache_dir, "stage2_mathwriting_meta.json")
-            meta = {"count": len(samples), "type": "mathwriting", "has_images": True}
-            self._save_cache(meta, meta_file)
+            # Save cache
+            self._save_cache(samples, cache_file)
             
             logger.info(f"Stage 2 complete: {len(samples)} samples")
             return samples
@@ -228,11 +237,10 @@ class DataManager:
                 logger.info(f"Attempting HME100K from HF mirror: {mirror}")
                 hf_dataset = self.downloader.get_hf_dataset(mirror, split="train")
                 if hf_dataset is not None:
-                    samples = self.parser.parse_mathwriting(hf_dataset)
+                    extract_dir = os.path.join(self.data_dir, "hme100k")
+                    samples = self.parser.parse_mathwriting(hf_dataset, extract_dir=extract_dir, max_samples=100000)
                     if samples:
-                        # Cache metadata only (PIL images can't be JSON serialized)
-                        meta_file = os.path.join(self.cache_dir, "stage3_hme100k_meta.json")
-                        self._save_cache({"count": len(samples), "source": mirror}, meta_file)
+                        self._save_cache(samples, cache_file)
                         logger.info(f"Stage 3b (HME100K from HF) complete: {len(samples)} samples")
                         return samples
             except Exception as e:

@@ -73,6 +73,7 @@ class Config:
     save_every: int = 2
     eval_every: int = 2
     hf_repo_id: str = "TAMER-OCR/Shared-Checkpoints"
+    hf_dataset_repo: str = "Verified-Datasets"  # Will dynamically prepend your HF username
     
     # Authentication & Network Configuration
     # Hardcoded (base64-encoded) tokens for Colab/Kaggle consistency

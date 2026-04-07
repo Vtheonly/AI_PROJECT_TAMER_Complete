@@ -427,31 +427,34 @@ class DatasetParser:
     # -----------------------------------------------------------------
     # MathWriting Parser (Hugging Face)
     # -----------------------------------------------------------------
-    def parse_mathwriting(self, hf_dataset) -> List[Dict[str, Any]]:
+    def parse_mathwriting(self, hf_dataset, extract_dir: str = None, max_samples: int = None) -> List[Dict[str, Any]]:
         """
         Parse MathWriting from Hugging Face dataset object.
+        Iteratively saves PIL images to disk to prevent RAM OOM in environments like Colab.
         
-        HF datasets typically provide:
-        - 'image' column with PIL.Image objects
-        - 'text' or 'latex' column with formula strings
+        Args:
+            hf_dataset: Hugging Face dataset object
+            extract_dir: Directory to save images to disk (prevents RAM OOM)
+            max_samples: Maximum number of samples to parse (None for all)
         
-        Returns list with PIL.Image objects (not paths).
+        Returns:
+            List of dicts with 'image' (str path) and 'latex' keys
         """
-        logger.info("Parsing MathWriting from Hugging Face dataset object.")
+        logger.info(f"Parsing Hugging Face dataset object. Max samples: {max_samples or 'All'}")
         samples = []
 
         if hf_dataset is None:
-            logger.warning("MathWriting HF dataset is None.")
+            logger.warning("HF dataset is None.")
             return samples
+
+        img_dir = None
+        if extract_dir:
+            img_dir = os.path.join(extract_dir, "images")
+            os.makedirs(img_dir, exist_ok=True)
 
         try:
             # Detect column names dynamically
-            if hasattr(hf_dataset, 'column_names'):
-                columns = hf_dataset.column_names
-            elif hasattr(hf_dataset, 'features'):
-                columns = list(hf_dataset.features.keys())
-            else:
-                columns = []
+            columns = getattr(hf_dataset, 'column_names', list(getattr(hf_dataset, 'features', {}).keys()))
             
             # Find image column
             img_col = next((c for c in columns if 'image' in c.lower()),
@@ -463,10 +466,14 @@ class DatasetParser:
                               next((c for c in columns if 'formula' in c.lower()), None)))
             
             if not txt_col:
-                logger.error(f"Could not find text/latex column in MathWriting dataset. Columns: {columns}")
+                logger.error(f"Could not find text/latex column. Columns: {columns}")
                 return samples
 
-            for item in hf_dataset:
+            for idx, item in enumerate(hf_dataset):
+                if max_samples and idx >= max_samples:
+                    logger.info(f"Reached max_samples limit ({max_samples}). Stopping parse.")
+                    break
+                    
                 try:
                     latex = str(item.get(txt_col, '')).strip()
                     if not latex:
@@ -474,29 +481,46 @@ class DatasetParser:
                     
                     if img_col and img_col in item:
                         img = item[img_col]
-                        # Handle HF Image object vs PIL Image
-                        if hasattr(img, 'convert'):  # PIL Image
-                            samples.append({"image": img.convert('L'), "latex": latex})
+                        
+                        # Process image
+                        pil_img = None
+                        if hasattr(img, 'convert'):
+                            pil_img = img.convert('L')
                         elif isinstance(img, dict) and 'bytes' in img:
-                            # HF encoded image
                             import io
                             pil_img = Image.open(io.BytesIO(img['bytes'])).convert('L')
-                            samples.append({"image": pil_img, "latex": latex})
                         elif isinstance(img, dict) and 'path' in img:
                             samples.append({"image": img['path'], "latex": latex})
+                            continue
                         else:
                             samples.append({"image": img, "latex": latex})
-                    else:
-                        # No image column, store latex only (skip if image required)
-                        logger.warning(f"No image found for item with latex: {latex[:50]}...")
+                            continue
+                            
+                        # Save to disk immediately to prevent RAM OOM
+                        if pil_img and img_dir:
+                            import hashlib
+                            h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
+                            img_path = os.path.join(img_dir, f"img_{idx}_{h}.png")
+                            if not os.path.exists(img_path):
+                                pil_img.save(img_path)
+                            samples.append({"image": img_path, "latex": latex})
+                            
+                            # Log progress to show activity without spamming console
+                            if len(samples) % 5000 == 0:
+                                logger.info(f"  Parsed & saved {len(samples)} images...")
+                                
+                        elif pil_img:
+                            # Fallback to RAM if no extract_dir provided
+                            samples.append({"image": pil_img, "latex": latex})
+                            
                 except Exception as e:
-                    logger.debug(f"Skipping item due to error: {e}")
+                    logger.debug(f"Skipping item {idx} due to error: {e}")
                     continue
                     
         except Exception as e:
-            logger.error(f"Error parsing MathWriting HF dataset: {e}")
+            logger.error(f"Error parsing HF dataset: {e}")
 
-        logger.info(f"MathWriting parsed: {len(samples)} valid samples found.")
+        logger.info(f"HF dataset parsing complete: {len(samples)} valid samples found.")
         return samples
 
     # -----------------------------------------------------------------
