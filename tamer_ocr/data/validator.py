@@ -670,7 +670,8 @@ class DatasetValidator:
                 if not img_path.exists():
                     img.save(img_path)
                 
-                valid_samples.append({'image_path': str(img_path), 'latex': latex})
+                # Store as absolute path so _extract_samples() recognizes it
+                valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
                 
                 if (idx + 1) % 10000 == 0:
                     logger.info(f"  Saved {idx + 1}/{len(hf_ds)} images...")
@@ -855,7 +856,8 @@ class DatasetValidator:
                         if not img_path.exists():
                             img.save(img_path)
                             
-                        valid_samples.append({'image_path': str(img_path), 'latex': latex})
+                        # Store as absolute path so _extract_samples() recognizes it
+                        valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
                 
                 with open(annot_file, 'w', encoding='utf-8') as f:
                     json.dump(valid_samples, f, ensure_ascii=False, indent=2)
