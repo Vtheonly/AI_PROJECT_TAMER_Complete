@@ -653,36 +653,96 @@ class DatasetValidator:
             logger.error(f"Unknown dataset: {dataset_name}. Cannot download.")
             return False
 
-        downloader = AdvDatasetDownloader(data_dir=str(self.data_dir.parent))
-        dataset_dir = downloader.get_dataset_dir(dataset_name)
+        from .data_manager import DataManager
+        dm = DataManager(self.config)
+        dataset_dir = self.data_dir / dataset_name
 
         logger.info(f"Attempting to download dataset: {dataset_name}")
         logger.info(f"  Destination: {dataset_dir}")
 
         try:
-            # Download archives if defined
-            for archive_info in config.archives:
-                dest = dataset_dir / archive_info.filename
-                downloader.download_file(
-                    url=archive_info.url,
-                    dest_path=str(dest),
-                    expected_sha256=archive_info.sha256,
-                    expected_size=archive_info.expected_size_bytes,
-                )
+            samples = []
+            if dataset_name == "im2latex-100k":
+                samples = dm.get_stage1_im2latex(force_refresh=True)
+            elif dataset_name == "mathwriting":
+                samples = dm.get_stage2_mathwriting(force_refresh=True)
+            elif dataset_name == "crohme":
+                samples = dm.get_stage3_crohme(force_refresh=True)
+            elif dataset_name == "hme100k":
+                samples = dm.get_stage3_hme100k(force_refresh=True)
+            else:
+                # Custom or simple archive fallback
+                from .downloader import AdvDatasetDownloader
+                downloader = AdvDatasetDownloader(data_dir=str(self.data_dir))
+                for archive_info in config.archives:
+                    dest = dataset_dir / archive_info.filename
+                    downloader.download_file(
+                        url=archive_info.url,
+                        dest_path=str(dest),
+                        expected_sha256=archive_info.sha256,
+                        expected_size=archive_info.expected_size_bytes,
+                    )
+                    if archive_info.is_archive or archive_info.extract_to:
+                        extract_path = dataset_dir / (archive_info.extract_to or "")
+                        downloader.extract_archive(str(dest), str(extract_path))
+                
+                result = self.validate_all()
+                return result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
 
-            # Extract if archive
-            for archive_info in config.archives:
-                dest = dataset_dir / archive_info.filename
-                if archive_info.is_archive or archive_info.extract_to:
-                    extract_path = dataset_dir / (archive_info.extract_to or "")
-                    downloader.extract_archive(str(dest), str(extract_path))
+            if samples:
+                os.makedirs(dataset_dir, exist_ok=True)
+                
+                # Ensure required directories exist
+                for req_dir in config.required_directories:
+                    (dataset_dir / req_dir).mkdir(parents=True, exist_ok=True)
+                
+                annot_file = dataset_dir / config.annotations_file
+                valid_samples = []
+                
+                # Save parsed samples to annotations.json so the validator can pick them up
+                for idx, s in enumerate(samples):
+                    img = s.get('image')
+                    latex = s.get('latex', '')
+                    
+                    if not latex:
+                        continue
+                        
+                    if isinstance(img, str):
+                        # It's a file path
+                        valid_samples.append({'image_path': img, 'latex': latex})
+                    else:
+                        # It's a PIL Image (e.g. from HuggingFace / MathWriting)
+                        img_dir = dataset_dir / (config.images_dir if config.images_dir else "images")
+                        img_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        import hashlib
+                        h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
+                        img_filename = f"img_{idx}_{h}.png"
+                        img_path = img_dir / img_filename
+                        
+                        if not img_path.exists():
+                            img.save(img_path)
+                            
+                        valid_samples.append({'image_path': str(img_path), 'latex': latex})
+                
+                with open(annot_file, 'w', encoding='utf-8') as f:
+                    json.dump(valid_samples, f, ensure_ascii=False, indent=2)
+                    
+                logger.info(f"Saved {len(valid_samples)} mapped samples to {annot_file}")
+            else:
+                logger.error(f"DataManager returned 0 samples for {dataset_name}. Check download logs.")
+                return False
 
-            # After download, validate
-            result = self.validate_all()
-            return result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
+            # Refresh validation state for this dataset
+            self.result = ValidationResult()
+            self._validate_data_directory()
+            self._validate_single_dataset(dataset_name)
+            return self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
 
         except Exception as e:
             logger.error(f"Download/validation failed for {dataset_name}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return False
 
 

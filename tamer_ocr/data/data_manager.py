@@ -76,14 +76,30 @@ class DataManager:
         if not force_refresh and os.path.exists(cache_file):
             try:
                 self._stage1_cache = self._load_cache(cache_file)
-                logger.info(f"Loaded Stage 1 from cache: {len(self._stage1_cache)} samples")
-                return self._stage1_cache
+                if isinstance(self._stage1_cache, list) and self._stage1_cache:
+                    logger.info(f"Loaded Stage 1 from cache: {len(self._stage1_cache)} samples")
+                    return self._stage1_cache
             except Exception as e:
                 logger.warning(f"Cache load failed, refreshing: {e}")
         
         # Download and parse
         try:
-            extract_dir = os.path.join(self.data_dir, "im2latex")
+            extract_dir = os.path.join(self.data_dir, "im2latex-100k")
+            
+            # First try HF mirror to avoid Kaggle auth issues
+            try:
+                logger.info("Attempting Im2LaTeX from HuggingFace mirror (yuntian-deng/im2latex-100k)...")
+                hf_dataset = self.downloader.get_hf_dataset("yuntian-deng/im2latex-100k", split="train")
+                if hf_dataset is not None:
+                    samples = self.parser.parse_mathwriting(hf_dataset)
+                    if samples:
+                        self._save_cache(samples, cache_file)
+                        self._stage1_cache = samples
+                        logger.info(f"Stage 1 complete via HF: {len(samples)} samples")
+                        return samples
+            except Exception as e:
+                logger.info(f"HF mirror failed, falling back to Kaggle: {e}")
+
             self.downloader.download_kaggle("shahrukhkhan/im2latex100k", extract_dir)
             samples = self.parser.parse_im2latex(extract_dir)
             
@@ -327,11 +343,17 @@ class DataManager:
             cacheable = [
                 s for s in samples 
                 if isinstance(s.get('image'), str) and os.path.exists(s.get('image', ''))
-            ] or samples
+            ]
+            
+            if not cacheable and samples:
+                # If all samples have PIL images, just save metadata
+                cacheable = {"count": len(samples), "has_pil_images": True}
+            elif not cacheable:
+                cacheable = []
             
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cacheable, f, ensure_ascii=False)
-            logger.debug(f"Saved cache: {cache_file} ({len(cacheable)} items)")
+            logger.debug(f"Saved cache: {cache_file} ({len(cacheable) if isinstance(cacheable, list) else 1} items)")
         except Exception as e:
             logger.warning(f"Could not save cache: {e}")
     
