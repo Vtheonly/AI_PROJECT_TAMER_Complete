@@ -66,8 +66,7 @@ class Config:
     # Authentication & Network Configuration
     # These can be set via config or environment variables (env takes precedence)
     hf_token: str = field(default_factory=lambda: os.getenv("HF_TOKEN", ""))
-    kaggle_username: str = field(default_factory=lambda: os.getenv("KAGGLE_USERNAME", ""))
-    kaggle_key: str = field(default_factory=lambda: os.getenv("KAGGLE_KEY", ""))
+    kaggle_api_token: str = field(default_factory=lambda: os.getenv("KAGGLE_API_TOKEN", ""))
     http_proxy: str = field(default_factory=lambda: os.getenv("HTTP_PROXY", ""))
     https_proxy: str = field(default_factory=lambda: os.getenv("HTTPS_PROXY", ""))
 
@@ -82,7 +81,12 @@ class Config:
         if self.https_proxy:
             os.environ['HTTPS_PROXY'] = self.https_proxy
             
-        # Configure Kaggle Auth explicitly
-        if self.kaggle_username and self.kaggle_key:
-            os.environ['KAGGLE_USERNAME'] = self.kaggle_username
-            os.environ['KAGGLE_KEY'] = self.kaggle_key
+        # Configure Kaggle Auth explicitly (supports both old and new auth methods)
+        if self.kaggle_api_token:
+            os.environ['KAGGLE_API_TOKEN'] = self.kaggle_api_token
+        # Backward compatibility with old username/key method
+        kaggle_username = os.getenv("KAGGLE_USERNAME", "")
+        kaggle_key = os.getenv("KAGGLE_KEY", "")
+        if kaggle_username and kaggle_key:
+            os.environ['KAGGLE_USERNAME'] = kaggle_username
+            os.environ['KAGGLE_KEY'] = kaggle_key

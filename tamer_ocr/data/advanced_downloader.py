@@ -17,10 +17,13 @@ import logging
 import shutil
 import zipfile
 import tarfile
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Callable
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger("TAMER.Downloader")
 
@@ -47,8 +50,8 @@ class AdvDownloader:
     Features:
     - Hugging Face datasets with token authentication
     - Kaggle API with credential authentication
-    - Zenodo direct ZIP streaming
-    - GitHub repository cloning
+    - Zenodo direct ZIP streaming with requests (robust large file handling)
+    - GitHub repository cloning with shallow clone (--depth 1)
     - HTTP/HTTPS proxy configuration
     - Download resume and retry logic
     
@@ -72,8 +75,9 @@ class AdvDownloader:
         Args:
             config: Configuration object with optional attributes:
                 - hf_token: Hugging Face authentication token
-                - kaggle_username: Kaggle API username
-                - kaggle_key: Kaggle API key
+                - kaggle_api_token: Kaggle API token (new method, recommended)
+                - kaggle_username: Kaggle API username (legacy method)
+                - kaggle_key: Kaggle API key (legacy method)
                 - http_proxy: HTTP proxy URL
                 - https_proxy: HTTPS proxy URL
         """
@@ -84,6 +88,9 @@ class AdvDownloader:
         
         # Configure authentication
         self._setup_auth()
+        
+        # Setup requests session with retry strategy
+        self.session = self._create_session()
 
     def _setup_proxies(self):
         """Configure HTTP/HTTPS proxies from config."""
@@ -104,14 +111,55 @@ class AdvDownloader:
         if self.hf_token:
             logger.info("Hugging Face token configured")
             
-        # Kaggle credentials
-        self.kaggle_username = getattr(self.config, 'kaggle_username', '') or os.getenv('KAGGLE_USERNAME', '')
-        self.kaggle_key = getattr(self.config, 'kaggle_key', '') or os.getenv('KAGGLE_KEY', '')
+        # Kaggle credentials - supports both new API token and old username/key
+        self.kaggle_api_token = getattr(self.config, 'kaggle_api_token', '') or os.getenv('KAGGLE_API_TOKEN', '')
         
-        if self.kaggle_username and self.kaggle_key:
-            os.environ['KAGGLE_USERNAME'] = self.kaggle_username
-            os.environ['KAGGLE_KEY'] = self.kaggle_key
-            logger.info("Kaggle credentials configured")
+        if self.kaggle_api_token:
+            os.environ['KAGGLE_API_TOKEN'] = self.kaggle_api_token
+            logger.info("Kaggle API Token configured")
+        else:
+            # Fall back to old username/key method for backward compatibility
+            self.kaggle_username = getattr(self.config, 'kaggle_username', '') or os.getenv('KAGGLE_USERNAME', '')
+            self.kaggle_key = getattr(self.config, 'kaggle_key', '') or os.getenv('KAGGLE_KEY', '')
+            
+            if self.kaggle_username and self.kaggle_key:
+                os.environ['KAGGLE_USERNAME'] = self.kaggle_username
+                os.environ['KAGGLE_KEY'] = self.kaggle_key
+                logger.info("Kaggle credentials configured (legacy method)")
+            elif self.kaggle_username or self.kaggle_key:
+                logger.warning(
+                    "Incomplete Kaggle credentials. Both KAGGLE_USERNAME and KAGGLE_KEY are required.\n"
+                    "To set up Kaggle credentials:\n"
+                    "  1. Go to https://www.kaggle.com/settings/account\n"
+                    "  2. Create a new API token\n"
+                    "  3. Set KAGGLE_API_TOKEN environment variable\n"
+                    "     or add kaggle_api_token to your config object"
+                )
+    
+    def _create_session(self) -> requests.Session:
+        """Create a requests session with retry strategy for robust downloads."""
+        session = requests.Session()
+        
+        # Configure retry strategy with exponential backoff
+        retry_strategy = Retry(
+            total=self.MAX_RETRIES,
+            backoff_factor=self.BACKOFF_FACTOR,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
+            raise_on_status=False
+        )
+        
+        # Mount adapters with retry strategy
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Set default headers
+        session.headers.update({
+            'User-Agent': 'TAMER-OCR/1.0 (Dataset Downloader)'
+        })
+        
+        return session
         
     # -----------------------------------------------------------------
     # Hugging Face Download
@@ -170,9 +218,26 @@ class AdvDownloader:
             logger.info(f"Kaggle dataset already extracted at {extract_dir}")
             return
             
-        if not self.kaggle_username or not self.kaggle_key:
-            logger.error("KAGGLE_USERNAME and KAGGLE_KEY must be provided in config or env.")
-            raise ValueError("Missing Kaggle Credentials. Set KAGGLE_USERNAME and KAGGLE_KEY environment variables.")
+        # Check for authentication - new token or old username/key
+        kaggle_api_token = self.kaggle_api_token or os.getenv('KAGGLE_API_TOKEN', '')
+        kaggle_username = getattr(self, 'kaggle_username', '') or os.getenv('KAGGLE_USERNAME', '')
+        kaggle_key = getattr(self, 'kaggle_key', '') or os.getenv('KAGGLE_KEY', '')
+        
+        if not kaggle_api_token and not (kaggle_username and kaggle_key):
+            error_msg = (
+                "Missing Kaggle Credentials. Authentication is required to download datasets from Kaggle.\n"
+                "To set up Kaggle credentials (NEW METHOD - recommended):\n"
+                "  1. Go to https://www.kaggle.com/settings/account\n"
+                "  2. Click 'Create New API Token'\n"
+                "  3. Set environment variable:\n"
+                "     export KAGGLE_API_TOKEN=<your-token>\n"
+                "  4. Or add kaggle_api_token to your config object.\n\n"
+                "Alternatively (OLD METHOD - deprecated):\n"
+                "  - Place the kaggle.json file at ~/.kaggle/kaggle.json\n"
+                "  - Or set KAGGLE_USERNAME and KAGGLE_KEY environment variables"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         logger.info(f"Downloading Kaggle dataset: {dataset_identifier}")
         
@@ -191,7 +256,7 @@ class AdvDownloader:
             
         except ImportError:
             logger.error("Kaggle API library not installed. Run: pip install kaggle")
-            raise DownloadError("Kaggle package not installed")
+            raise DownloadError("Kaggle package not installed. Run: pip install kaggle>=1.5.16")
         except Exception as e:
             logger.error(f"Kaggle download failed: {e}")
             raise DownloadError(f"Kaggle download failed: {e}")
@@ -199,13 +264,15 @@ class AdvDownloader:
     # -----------------------------------------------------------------
     # Zenodo ZIP Download
     # -----------------------------------------------------------------
-    def download_zenodo_zip(self, url: str, extract_dir: str):
+    def download_zenodo_zip(self, url: str, extract_dir: str, verify_ssl: bool = True):
         """
         Stream a ZIP from a direct URL (e.g., Zenodo) and extract it.
+        Uses requests library for robust handling of large file downloads.
         
         Args:
             url: Direct download URL for the ZIP file
             extract_dir: Directory to extract files to
+            verify_ssl: Whether to verify SSL certificates (set False for problematic certs)
         """
         os.makedirs(extract_dir, exist_ok=True)
         zip_path = os.path.join(extract_dir, "dataset.zip")
@@ -217,7 +284,7 @@ class AdvDownloader:
         logger.info(f"Downloading Zenodo ZIP from {url}...")
         
         try:
-            self._download_with_progress(url, zip_path)
+            self._download_large_file_with_requests(url, zip_path, verify_ssl=verify_ssl)
             
             logger.info("Extracting ZIP...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -240,7 +307,7 @@ class AdvDownloader:
     # -----------------------------------------------------------------
     def download_github(self, repo_url: str, extract_dir: str):
         """
-        Clone a GitHub repository.
+        Clone a GitHub repository with shallow clone (--depth 1).
         
         Args:
             repo_url: GitHub repository URL
@@ -249,17 +316,40 @@ class AdvDownloader:
         if os.path.exists(os.path.join(extract_dir, ".git")):
             logger.info(f"GitHub repository already cloned at {extract_dir}")
             return
+        
+        # Check if git is installed
+        if not shutil.which("git"):
+            error_msg = (
+                "Git is not installed or not found in PATH.\n"
+                "Please install git: https://git-scm.com/downloads\n"
+                "On Ubuntu/Debian: sudo apt-get install git\n"
+                "On macOS: xcode-select --install"
+            )
+            logger.error(error_msg)
+            raise DownloadError(error_msg)
             
-        logger.info(f"Cloning GitHub repository from {repo_url}...")
+        logger.info(f"Cloning GitHub repository from {repo_url} (shallow clone)...")
         
         try:
             os.makedirs(extract_dir, exist_ok=True)
-            # Use git command for cloning
-            result = os.system(f"git clone {repo_url} {extract_dir} 2>&1")
-            if result == 0:
-                logger.info("Clone complete.")
+            # Use subprocess with --depth 1 for shallow clone (much faster for large repos)
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url, extract_dir],
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 hour timeout for very large repos
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"Clone complete: {extract_dir}")
             else:
-                raise DownloadError(f"git clone failed with exit code {result}")
+                error_msg = f"git clone failed with exit code {result.returncode}\nstderr: {result.stderr}"
+                logger.error(error_msg)
+                raise DownloadError(error_msg)
+        except subprocess.TimeoutExpired:
+            error_msg = f"git clone timed out after 1 hour. Consider increasing timeout or checking network."
+            logger.error(error_msg)
+            raise DownloadError(error_msg)
         except Exception as e:
             logger.error(f"Failed to clone repository: {e}")
             raise
@@ -267,8 +357,16 @@ class AdvDownloader:
     # -----------------------------------------------------------------
     # Generic Download with Progress
     # -----------------------------------------------------------------
-    def _download_with_progress(self, url: str, dest_path: str):
-        """Download a file with progress tracking and retry logic."""
+    def _download_large_file_with_requests(self, url: str, dest_path: str, verify_ssl: bool = True):
+        """
+        Download a large file using requests with streaming for robust handling.
+        Supports resume, progress tracking, and automatic retry.
+        
+        Args:
+            url: Download URL
+            dest_path: Destination file path
+            verify_ssl: Whether to verify SSL certificates
+        """
         dest = Path(dest_path)
         
         # Check for resume
@@ -277,45 +375,54 @@ class AdvDownloader:
             resume_pos = dest.stat().st_size
             logger.info(f"Resuming download from {resume_pos} bytes")
         
-        for retry in range(self.MAX_RETRIES):
-            try:
-                req = Request(url)
-                req.add_header('User-Agent', 'TAMER-OCR/1.0 (Dataset Downloader)')
-                
-                if resume_pos > 0:
-                    req.add_header('Range', f'bytes={resume_pos}-')
-                
-                with urlopen(req, timeout=self.TIMEOUT) as response:
-                    total_size = int(response.headers.get('Content-Length', 0))
-                    
-                    mode = 'ab' if resume_pos > 0 else 'wb'
-                    with open(dest_path, mode) as f:
-                        downloaded = resume_pos
-                        while True:
-                            chunk = response.read(self.CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Log progress every 1MB
-                            if downloaded % (1024 * 1024) < self.CHUNK_SIZE:
-                                progress = (downloaded / max(1, total_size)) * 100 if total_size > 0 else 0
-                                logger.info(f"  Downloaded: {downloaded // (1024*1024)}MB ({progress:.1f}%)")
-                                
-                logger.info(f"Download complete: {dest_path}")
-                return
-                
-            except (URLError, HTTPError, ConnectionError) as e:
-                backoff = self.BACKOFF_FACTOR * (2 ** retry)
-                logger.warning(f"Download attempt {retry+1}/{self.MAX_RETRIES} failed: {e}")
-                logger.info(f"  Retrying in {backoff}s...")
-                time.sleep(backoff)
-            except Exception as e:
-                logger.error(f"Unexpected error during download: {e}")
-                raise
-                
-        raise DownloadError(f"Failed to download after {self.MAX_RETRIES} attempts")
+        headers = {}
+        if resume_pos > 0:
+            headers['Range'] = f'bytes={resume_pos}-'
+        
+        try:
+            response = self.session.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=self.TIMEOUT,
+                verify=verify_ssl
+            )
+            response.raise_for_status()
+            
+            # Get total size
+            content_length = int(response.headers.get('Content-Length', 0))
+            if resume_pos > 0:
+                content_length += resume_pos
+            
+            mode = 'ab' if resume_pos > 0 else 'wb'
+            downloaded = resume_pos
+            
+            with open(dest_path, mode) as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Log progress every 10MB
+                        if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
+                            progress = (downloaded / max(1, content_length)) * 100 if content_length > 0 else 0
+                            logger.info(
+                                f"  Downloaded: {downloaded // (1024*1024)}MB / "
+                                f"{content_length // (1024*1024)}MB ({progress:.1f}%)"
+                            )
+            
+            logger.info(f"Download complete: {dest_path} ({downloaded // (1024*1024)}MB)")
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Download failed: {e}")
+            raise DownloadError(f"Failed to download {url}: {e}")
+    
+    def _download_with_progress(self, url: str, dest_path: str):
+        """Download a file with progress tracking and retry logic.
+        Deprecated: Use _download_large_file_with_requests instead.
+        Kept for backward compatibility.
+        """
+        self._download_large_file_with_requests(url, dest_path)
 
     # -----------------------------------------------------------------
     # Utility Methods
