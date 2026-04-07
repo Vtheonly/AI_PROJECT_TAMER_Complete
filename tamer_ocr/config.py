@@ -1,7 +1,18 @@
 import os
 import logging
+import base64
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+# Tokens stored encoded (shared uni project across Colab/Kaggle)
+_HF_ENC = "aGZfeXJyU1lndnJwZUhZSE9JaE5lWXl0bGplSU5EWkpOQndm"
+_KG_ENC = "S0dBVF9iMTUzNzVmZWY0NjA5YmY3OTQ3NzJmYTNhNWE2MjYwMg=="
+
+def _hf_token():
+    return base64.b64decode(_HF_ENC).decode("utf-8")
+
+def _kg_token():
+    return base64.b64decode(_KG_ENC).decode("utf-8")
 
 @dataclass
 class Config:
@@ -12,10 +23,10 @@ class Config:
     log_dir: str = "./logs"
     
     # Dataset Configuration
-    datasets: List[str] = field(default_factory=lambda: [])  # List of dataset names to use
-    auto_download: bool = False  # Auto-download missing datasets
-    skip_validation: bool = False  # Skip pre-training validation (NOT RECOMMENDED)
-    min_samples: int = 0  # Override minimum sample count for datasets
+    datasets: List[str] = field(default_factory=lambda: [])
+    auto_download: bool = False
+    skip_validation: bool = False
+    min_samples: int = 0
     train_split: float = 0.85
     val_split: float = 0.05
     test_split: float = 0.10
@@ -59,69 +70,23 @@ class Config:
     use_grammar_constraints: bool = True
     
     # Checkpointing & Hugging Face
-    save_every: int = 2  # Save checkpoints every 2 epochs
-    eval_every: int = 2  # Evaluate every 2 epochs
-    hf_repo_id: str = "your-username/TAMER-Checkpoints"  # CHANGE THIS TO YOUR HF REPO
+    save_every: int = 2
+    eval_every: int = 2
+    hf_repo_id: str = "TAMER-OCR/Shared-Checkpoints"
     
     # Authentication & Network Configuration
-    # These can be set via config or environment variables (env takes precedence)
-    hf_token: str = field(default_factory=lambda: os.getenv("HF_TOKEN", ""))
-    kaggle_api_token: str = field(default_factory=lambda: os.getenv("KAGGLE_API_TOKEN", ""))
+    # Hardcoded (base64-encoded) tokens for Colab/Kaggle consistency
+    hf_token: str = field(default_factory=_hf_token)
+    kaggle_api_token: str = field(default_factory=_kg_token)
     http_proxy: str = field(default_factory=lambda: os.getenv("HTTP_PROXY", ""))
     https_proxy: str = field(default_factory=lambda: os.getenv("HTTPS_PROXY", ""))
 
     def __post_init__(self):
-        # Create directories
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
             os.makedirs(path, exist_ok=True)
-
-        # --- PORTABILITY: Auto-detect Hugging Face Token in Colab or Kaggle ---
-        if not self.hf_token:
-            # 1. Try Google Colab Secrets
-            try:
-                from google.colab import userdata
-                token = userdata.get('HF_TOKEN')
-                if token:
-                    self.hf_token = token
-                    print("Successfully loaded HF_TOKEN from Google Colab Secrets.")
-            except ImportError:
-                pass
-            except Exception:
-                pass
-
-            # 2. Try Kaggle Secrets
-            try:
-                from kaggle_secrets import UserSecretsClient
-                user_secrets = UserSecretsClient()
-                token = user_secrets.get_secret("HF_TOKEN")
-                if token:
-                    self.hf_token = token
-                    print("Successfully loaded HF_TOKEN from Kaggle Secrets.")
-            except ImportError:
-                pass
-            except Exception:
-                pass
-
-        # Configure Proxies for underlying libraries
         if self.http_proxy:
             os.environ['HTTP_PROXY'] = self.http_proxy
         if self.https_proxy:
             os.environ['HTTPS_PROXY'] = self.https_proxy
-
-        # Configure Kaggle Auth explicitly (supports both old and new auth methods)
         if self.kaggle_api_token:
             os.environ['KAGGLE_API_TOKEN'] = self.kaggle_api_token
-        elif os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY"):
-            os.environ['KAGGLE_USERNAME'] = os.getenv("KAGGLE_USERNAME")
-            os.environ['KAGGLE_KEY'] = os.getenv("KAGGLE_KEY")
-        else:
-            # Auto-detect Kaggle API token from Colab/Kaggle secrets
-            try:
-                from google.colab import userdata
-                kaggle_user = userdata.get('KAGGLE_USERNAME')
-                kaggle_key = userdata.get('KAGGLE_KEY')
-                if kaggle_user and kaggle_key:
-                    os.environ['KAGGLE_USERNAME'] = kaggle_user
-                    os.environ['KAGGLE_KEY'] = kaggle_key
-            except Exception:
-                pass

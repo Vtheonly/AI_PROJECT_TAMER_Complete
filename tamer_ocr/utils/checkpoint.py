@@ -21,7 +21,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, path):
 
 def push_checkpoint_to_hf(checkpoint_path, config, epoch, is_best=False):
     """Pushes a local checkpoint to Hugging Face Hub."""
-    if not config.hf_repo_id or config.hf_repo_id == "your-username/TAMER-Checkpoints":
+    if not config.hf_repo_id:
         logger.warning("hf_repo_id is not set. Skipping Hugging Face upload.")
         return
 
