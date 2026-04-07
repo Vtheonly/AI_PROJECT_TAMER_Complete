@@ -918,3 +918,7 @@ def validate_datasets(config, force: bool = False) -> ValidationResult:
         )
 
     return result
+
+
+# Backward compatibility alias
+validate_before_training = validate_datasets
