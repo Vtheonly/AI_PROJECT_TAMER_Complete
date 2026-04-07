@@ -1,6 +1,7 @@
 import os
 import logging
 from dataclasses import dataclass, field
+from typing import List, Optional
 
 @dataclass
 class Config:
@@ -9,6 +10,15 @@ class Config:
     output_dir: str = "./outputs"
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
+    
+    # Dataset Configuration
+    datasets: List[str] = field(default_factory=lambda: [])  # List of dataset names to use
+    auto_download: bool = False  # Auto-download missing datasets
+    skip_validation: bool = False  # Skip pre-training validation (NOT RECOMMENDED)
+    min_samples: int = 0  # Override minimum sample count for datasets
+    train_split: float = 0.85
+    val_split: float = 0.05
+    test_split: float = 0.10
     
     # Image Settings
     img_height: int = 128
@@ -52,8 +62,27 @@ class Config:
     save_every: int = 5
     eval_every: int = 5
     hf_repo_id: str = None  # e.g., "username/tamer-math-ocr"
-    hf_token: str = None
+    
+    # Authentication & Network Configuration
+    # These can be set via config or environment variables (env takes precedence)
+    hf_token: str = field(default_factory=lambda: os.getenv("HF_TOKEN", ""))
+    kaggle_username: str = field(default_factory=lambda: os.getenv("KAGGLE_USERNAME", ""))
+    kaggle_key: str = field(default_factory=lambda: os.getenv("KAGGLE_KEY", ""))
+    http_proxy: str = field(default_factory=lambda: os.getenv("HTTP_PROXY", ""))
+    https_proxy: str = field(default_factory=lambda: os.getenv("HTTPS_PROXY", ""))
 
     def __post_init__(self):
+        # Create directories
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
             os.makedirs(path, exist_ok=True)
+        
+        # Configure Proxies for underlying libraries
+        if self.http_proxy:
+            os.environ['HTTP_PROXY'] = self.http_proxy
+        if self.https_proxy:
+            os.environ['HTTPS_PROXY'] = self.https_proxy
+            
+        # Configure Kaggle Auth explicitly
+        if self.kaggle_username and self.kaggle_key:
+            os.environ['KAGGLE_USERNAME'] = self.kaggle_username
+            os.environ['KAGGLE_KEY'] = self.kaggle_key
