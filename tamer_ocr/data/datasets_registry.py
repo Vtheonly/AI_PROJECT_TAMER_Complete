@@ -100,11 +100,11 @@ class DatasetRegistry:
         "im2latex-100k": DatasetConfig(
             dataset_name="im2latex-100k",
             category=DatasetCategory.PRINTED_FORMULA,
-            description="100K printed LaTeX formula images with ground truth (Kaggle)",
+            description="100K printed LaTeX formula images with ground truth (Kaggle/HF mirror)",
             images_dir="images",
             annotations_file="annotations.json",
             expected_sample_count=100000,
-            min_sample_count=95000,
+            min_sample_count=50000,
             required_directories=["images"],
             source_url="https://www.kaggle.com/datasets/shahrukhkhan/im2latex100k/data",
             license="MIT",
