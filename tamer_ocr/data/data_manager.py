@@ -16,7 +16,8 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
-from .downloader import AdvDatasetDownloader, AdvDownloader
+from .downloader import AdvDatasetDownloader
+from .advanced_downloader import AdvDownloader
 from .parser import DatasetParser
 
 logger = logging.getLogger("TAMER.DataManager")
