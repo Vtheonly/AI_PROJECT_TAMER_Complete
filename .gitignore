@@ -1,2 +1,54 @@
-HF_TOKEN_REMOVED
-KGAT_*
+# Tokens and secrets
+*.txt
+!.gitignore
+!requirements.txt
+!CONTRIBUTING.txt
+!README.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Checkpoints and models
+*.pth
+*.pt
+checkpoints/
+models/
+*.ckpt
+
+# Data
+data/
+*.csv
+*.json
+
+# Environment variables
+.env
+.env.local
+*.env
+
+# Token files
+token.txt
+*.token
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
