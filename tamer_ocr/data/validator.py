@@ -559,13 +559,13 @@ class DatasetValidator:
             issues.append(ValidationIssue(
                 'CRITICAL', 'image',
                 f"... and {missing_images - max_report} more missing images",
-                dataset=dataset_name
+                affected_dataset=dataset_name
             ))
         if corrupt_images > max_report:
             issues.append(ValidationIssue(
                 'CRITICAL', 'image',
                 f"... and {corrupt_images - max_report} more corrupt images",
-                dataset=dataset_name
+                affected_dataset=dataset_name
             ))
 
         valid_count = len(valid_samples)

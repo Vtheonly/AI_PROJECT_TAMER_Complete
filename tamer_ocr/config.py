@@ -58,10 +58,10 @@ class Config:
     beam_width: int = 5
     use_grammar_constraints: bool = True
     
-    # Checkpointing
-    save_every: int = 5
-    eval_every: int = 5
-    hf_repo_id: str = None  # e.g., "username/tamer-math-ocr"
+    # Checkpointing & Hugging Face
+    save_every: int = 2  # Save checkpoints every 2 epochs
+    eval_every: int = 2  # Evaluate every 2 epochs
+    hf_repo_id: str = "your-username/TAMER-Checkpoints"  # CHANGE THIS TO YOUR HF REPO
     
     # Authentication & Network Configuration
     # These can be set via config or environment variables (env takes precedence)
@@ -74,19 +74,54 @@ class Config:
         # Create directories
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
             os.makedirs(path, exist_ok=True)
-        
+
+        # --- PORTABILITY: Auto-detect Hugging Face Token in Colab or Kaggle ---
+        if not self.hf_token:
+            # 1. Try Google Colab Secrets
+            try:
+                from google.colab import userdata
+                token = userdata.get('HF_TOKEN')
+                if token:
+                    self.hf_token = token
+                    print("Successfully loaded HF_TOKEN from Google Colab Secrets.")
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            # 2. Try Kaggle Secrets
+            try:
+                from kaggle_secrets import UserSecretsClient
+                user_secrets = UserSecretsClient()
+                token = user_secrets.get_secret("HF_TOKEN")
+                if token:
+                    self.hf_token = token
+                    print("Successfully loaded HF_TOKEN from Kaggle Secrets.")
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
         # Configure Proxies for underlying libraries
         if self.http_proxy:
             os.environ['HTTP_PROXY'] = self.http_proxy
         if self.https_proxy:
             os.environ['HTTPS_PROXY'] = self.https_proxy
-            
+
         # Configure Kaggle Auth explicitly (supports both old and new auth methods)
         if self.kaggle_api_token:
             os.environ['KAGGLE_API_TOKEN'] = self.kaggle_api_token
-        # Backward compatibility with old username/key method
-        kaggle_username = os.getenv("KAGGLE_USERNAME", "")
-        kaggle_key = os.getenv("KAGGLE_KEY", "")
-        if kaggle_username and kaggle_key:
-            os.environ['KAGGLE_USERNAME'] = kaggle_username
-            os.environ['KAGGLE_KEY'] = kaggle_key
+        elif os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY"):
+            os.environ['KAGGLE_USERNAME'] = os.getenv("KAGGLE_USERNAME")
+            os.environ['KAGGLE_KEY'] = os.getenv("KAGGLE_KEY")
+        else:
+            # Auto-detect Kaggle API token from Colab/Kaggle secrets
+            try:
+                from google.colab import userdata
+                kaggle_user = userdata.get('KAGGLE_USERNAME')
+                kaggle_key = userdata.get('KAGGLE_KEY')
+                if kaggle_user and kaggle_key:
+                    os.environ['KAGGLE_USERNAME'] = kaggle_user
+                    os.environ['KAGGLE_KEY'] = kaggle_key
+            except Exception:
+                pass

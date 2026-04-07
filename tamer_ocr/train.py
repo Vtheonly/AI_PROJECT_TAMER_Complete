@@ -22,7 +22,7 @@ from core.constraints import LaTeXGrammarConstraints
 from core.losses import TreeGuidedLoss
 from core.inference import constrained_beam_search
 from utils.metrics import calculate_metrics
-from utils.checkpoint import save_checkpoint, load_checkpoint
+from utils.checkpoint import save_checkpoint, load_checkpoint, push_checkpoint_to_hf
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 import torch
@@ -342,21 +342,32 @@ def main():
         
         if (epoch + 1) % config.eval_every == 0:
             metrics = validate(model, train_loader, tokenizer, grammar, config, device, logger)
-            
+
             is_best = metrics['exact'] > best_exprate
             if is_best:
                 best_exprate = metrics['exact']
+                best_path = os.path.join(config.checkpoint_dir, 'best.pt')
+
+                # Save locally
                 save_checkpoint(
-                    model, optimizer, scheduler, epoch + 1, metrics, 
-                    os.path.join(config.checkpoint_dir, 'best.pt')
+                    model, optimizer, scheduler, epoch + 1, metrics,
+                    best_path
                 )
-                
+                # Push to Hugging Face
+                push_checkpoint_to_hf(best_path, config, epoch + 1, is_best=True)
+
         if (epoch + 1) % config.save_every == 0:
+            latest_path = os.path.join(config.checkpoint_dir, 'latest.pt')
+            metrics_dict = metrics if 'metrics' in locals() else {}
+
+            # Save locally
             save_checkpoint(
-                model, optimizer, scheduler, epoch + 1, 
-                metrics if 'metrics' in locals() else {}, 
-                os.path.join(config.checkpoint_dir, 'latest.pt')
+                model, optimizer, scheduler, epoch + 1,
+                metrics_dict,
+                latest_path
             )
+            # Push to Hugging Face
+            push_checkpoint_to_hf(latest_path, config, epoch + 1, is_best=False)
 
 
 if __name__ == "__main__":
