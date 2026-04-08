@@ -47,7 +47,7 @@ class Config:
     # Training Parameters
     batch_size: int = 16
     accumulation_steps: int = 2
-    num_workers: int = 4
+    num_workers: int = 2
     num_epochs: int = 150
     lr: float = 3e-4
     min_lr: float = 1e-6

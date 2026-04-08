@@ -24,7 +24,7 @@ from core.inference import constrained_beam_search
 from utils.metrics import calculate_metrics
 from utils.checkpoint import save_checkpoint, load_checkpoint, push_checkpoint_to_hf
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 import torch
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, config, device, logger, epoch):
@@ -38,7 +38,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, config, device,
         ids = batch['ids'].to(device, non_blocking=True)
         parents = batch['parents'].to(device, non_blocking=True)
         
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             logits, pointers, coverage = model(images, ids, parents)
             loss, seq_loss, ptr_loss, cov_loss = criterion(logits, pointers, ids, parents, coverage)
             scaled_loss = loss / config.accumulation_steps
@@ -155,31 +155,16 @@ def load_datasets(config, logger):
 
 
 def parse_args():
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='TAMER OCR Training')
-    
-    # Dataset arguments
-    parser.add_argument('--datasets', nargs='+', default=None,
-                        help='List of datasets to use (e.g., im2latex-100k custom)')
-    parser.add_argument('--download', action='store_true',
-                        help='Auto-download missing datasets before training')
-    parser.add_argument('--data-dir', type=str, default=None,
-                        help='Override data directory path')
-    parser.add_argument('--list-datasets', action='store_true',
-                        help='List available datasets and exit')
-    
-    # Training arguments
-    parser.add_argument('--batch-size', type=int, default=None,
-                        help='Training batch size')
-    parser.add_argument('--num-epochs', type=int, default=None,
-                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=None,
-                        help='Learning rate')
-    parser.add_argument('--skip-validation', action='store_true',
-                        help='Skip dataset validation (NOT RECOMMENDED)')
-    parser.add_argument('--force', action='store_true',
-                        help='Force training even if validation has warnings')
-    
+    parser.add_argument('--datasets', nargs='+', default=None, help='List of datasets to use')
+    parser.add_argument('--download', action='store_true', help='Auto-download missing datasets before training')
+    parser.add_argument('--data-dir', type=str, default=None, help='Override data directory path')
+    parser.add_argument('--list-datasets', action='store_true', help='List available datasets and exit')
+    parser.add_argument('--batch-size', type=int, default=None, help='Training batch size')
+    parser.add_argument('--num-epochs', type=int, default=None, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
+    parser.add_argument('--skip-validation', action='store_true', help='Skip dataset validation')
+    parser.add_argument('--force', action='store_true', help='Force training even if validation has warnings')
     return parser.parse_args()
 
 
@@ -190,30 +175,21 @@ def main():
         from data.datasets_registry import get_registry, list_available_datasets
         available = list_available_datasets()
         print("\nAvailable Datasets:")
-        print("-" * 40)
         for name in available:
             ds_config = get_registry().get_config(name)
             desc = ds_config.description if ds_config else "Custom dataset"
             print(f"  {name}: {desc}")
-        print()
         return
     
     config = Config()
     
-    if args.datasets:
-        config.datasets = args.datasets
-    if args.download:
-        config.auto_download = True
-    if args.data_dir:
-        config.data_dir = args.data_dir
-    if args.skip_validation:
-        config.skip_validation = True
-    if args.batch_size:
-        config.batch_size = args.batch_size
-    if args.num_epochs:
-        config.num_epochs = args.num_epochs
-    if args.lr:
-        config.lr = args.lr
+    if args.datasets: config.datasets = args.datasets
+    if args.download: config.auto_download = True
+    if args.data_dir: config.data_dir = args.data_dir
+    if args.skip_validation: config.skip_validation = True
+    if args.batch_size: config.batch_size = args.batch_size
+    if args.num_epochs: config.num_epochs = args.num_epochs
+    if args.lr: config.lr = args.lr
     
     logger = setup_logger("TAMER", config.log_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -225,7 +201,6 @@ def main():
         logger.info("=" * 60)
         
         if config.auto_download:
-            logger.info("Auto-download mode enabled. Will download missing datasets.")
             try:
                 from data.validator import DatasetValidator
                 validator = DatasetValidator(config)
@@ -233,53 +208,30 @@ def main():
                 
                 for dataset_name in datasets:
                     if not validator.registry.validate_dataset_name(dataset_name):
-                        logger.warning(f"Unknown dataset '{dataset_name}', skipping download.")
                         continue
-                        
                     logger.info(f"Checking dataset: {dataset_name}")
-                    success = validator.try_download_and_validate(dataset_name)
-                    if success:
-                        logger.info(f"Successfully downloaded and validated '{dataset_name}'")
-                    else:
-                        logger.warning(f"Failed to download/validate '{dataset_name}'")
+                    validator.try_download_and_validate(dataset_name)
             except Exception as e:
                 logger.error(f"Download error: {e}")
         
         try:
             result = validate_before_training(config)
-            logger.info(f"Validation PASSED: {result.total_samples} samples ready for training")
+            logger.info(f"Validation PASSED: {result.total_samples} samples ready")
         except RuntimeError as e:
             logger.error(f"Validation FAILED: {e}")
-            logger.error("Fix all CRITICAL dataset issues before training.")
-            logger.error("Run with --download to auto-download missing datasets.")
             sys.exit(1)
-    else:
-        logger.warning("SKIP_VALIDATION is set. Training will proceed without dataset validation.")
     
     all_samples, dataset_info = load_datasets(config, logger)
-    
     if not all_samples:
         logger.error("No valid samples found! Cannot start training.")
         sys.exit(1)
     
-    logger.info(f"Total training samples: {len(all_samples)}")
-    
     tokenizer = LaTeXTokenizer()
     tokenizer.build_from_corpus([s['latex'] for s in all_samples])
     
-    train_ds = TreeMathDataset(
-        all_samples, config, tokenizer, 
-        transform=get_train_augmentation(config.img_height, config.img_width)
-    )
+    train_ds = TreeMathDataset(all_samples, config, tokenizer, transform=get_train_augmentation(config.img_height, config.img_width))
     train_sampler = CurriculumSampler(train_ds, config.curriculum_warmup_epochs)
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=config.batch_size, 
-        sampler=train_sampler, 
-        collate_fn=get_collate_fn(tokenizer.pad_id),
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, sampler=train_sampler, collate_fn=get_collate_fn(tokenizer.pad_id), num_workers=config.num_workers, pin_memory=True)
     
     model = TAMERCore(len(tokenizer), config).to(device)
     grammar = LaTeXGrammarConstraints(tokenizer)
@@ -287,16 +239,11 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, eta_min=config.min_lr)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
-    start_epoch, best_metrics = load_checkpoint(
-        os.path.join(config.checkpoint_dir, 'latest.pt'), 
-        model, optimizer, scheduler, device
-    )
+    start_epoch, best_metrics = load_checkpoint(os.path.join(config.checkpoint_dir, 'latest.pt'), model, optimizer, scheduler, device)
     best_exprate = best_metrics.get('exact', 0.0)
     
-    logger.info(f"Starting training from epoch {start_epoch}")
-
     for epoch in range(start_epoch, config.num_epochs):
         train_sampler.set_epoch(epoch)
         avg_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, config, device, logger, epoch)
