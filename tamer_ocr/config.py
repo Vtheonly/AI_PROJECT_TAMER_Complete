@@ -47,7 +47,7 @@ class Config:
     # Training Parameters
     batch_size: int = 16
     accumulation_steps: int = 2
-    num_workers: int = 2
+    num_workers: int = 2      # <--- CHANGED FROM 4 TO 2 TO PREVENT COLAB MEMORY SPIKES
     num_epochs: int = 150
     lr: float = 3e-4
     min_lr: float = 1e-6
@@ -73,10 +73,9 @@ class Config:
     save_every: int = 2
     eval_every: int = 2
     hf_repo_id: str = "TAMER-OCR/Shared-Checkpoints"
-    hf_dataset_repo: str = "Verified-Datasets"  # Will dynamically prepend your HF username
+    hf_dataset_repo: str = "Verified-Datasets" 
     
     # Authentication & Network Configuration
-    # Hardcoded (base64-encoded) tokens for Colab/Kaggle consistency
     hf_token: str = field(default_factory=_hf_token)
     kaggle_api_token: str = field(default_factory=_kg_token)
     http_proxy: str = field(default_factory=lambda: os.getenv("HTTP_PROXY", ""))

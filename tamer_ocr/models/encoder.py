@@ -6,7 +6,6 @@ import timm
 class PositionalEncoding2D(nn.Module):
     def __init__(self, d_model: int, max_h: int = 128, max_w: int = 128):
         super().__init__()
-        self.d_model = d_model
         self.row_embed = nn.Parameter(torch.randn(max_h, d_model // 2) * 0.1)
         self.col_embed = nn.Parameter(torch.randn(max_w, d_model // 2) * 0.1)
 
@@ -49,16 +48,19 @@ class SwinEncoder(nn.Module):
         dummy_out = self.backbone(dummy_input)[0]
         
         if dummy_out.dim() == 3:
-            self.format = "BLC"
-            feature_dim = dummy_out.shape[-1]
-        elif dummy_out.shape[-1] > dummy_out.shape[1] and dummy_out.shape[1] <= 64:
-            # E.g., [1, 16, 16, 384] -> channel is last
-            self.format = "BHWC"
-            feature_dim = dummy_out.shape[-1]
+            if dummy_out.shape[1] > dummy_out.shape[2]:
+                self.format = "BLC"
+                feature_dim = dummy_out.shape[2]
+            else:
+                self.format = "BCL"
+                feature_dim = dummy_out.shape[1]
         else:
-            # E.g., [1, 384, 16, 16] -> channel is first (after batch)
-            self.format = "BCHW"
-            feature_dim = dummy_out.shape[1]
+            if dummy_out.shape[1] > dummy_out.shape[-1]:
+                self.format = "BCHW"
+                feature_dim = dummy_out.shape[1]
+            else:
+                self.format = "BHWC"
+                feature_dim = dummy_out.shape[-1]
         
         self.proj = nn.Sequential(
             nn.Linear(feature_dim, config.d_model),
@@ -74,12 +76,18 @@ class SwinEncoder(nn.Module):
         x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
         features = self.backbone(x)[0]
         
+        B = features.shape[0]
         if self.format == "BCHW":
             features = features.permute(0, 2, 3, 1)  # NCHW -> NHWC
         elif self.format == "BLC":
-            B, L, C = features.shape
+            L = features.shape[1]
             H = W = int(L ** 0.5)
-            features = features.view(B, H, W, C)
+            features = features.view(B, H, W, -1)
+        elif self.format == "BCL":
+            features = features.permute(0, 2, 1)  # BCL -> BLC
+            L = features.shape[1]
+            H = W = int(L ** 0.5)
+            features = features.view(B, H, W, -1)
         
         features = self.proj(features)
         features = self.pos2d(features)
