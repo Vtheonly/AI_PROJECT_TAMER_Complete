@@ -156,7 +156,6 @@ class DataManager:
  
 
 
-
     def get_stage3_hme100k(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         logger.info("Loading Stage 3b: HME100K (Messy Handwritten)")
         cache_file = os.path.join(self.cache_dir, "stage3_hme100k.json")
@@ -164,51 +163,39 @@ class DataManager:
         if not force_refresh and os.path.exists(cache_file):
             try:
                 samples = self._load_cache(cache_file)
-                # Ensure the cached files actually exist on disk
-                valid =[s for s in samples if isinstance(s.get('image'), str) and os.path.exists(s['image'])]
+                valid = [s for s in samples if isinstance(s.get('image'), str) and os.path.exists(s['image'])]
                 if len(valid) == len(samples) and len(samples) > 0:
                     logger.info(f"Loaded Stage 3 HME100K from cache: {len(samples)} samples")
                     return samples
                 elif len(samples) > 0:
-                    logger.warning(f"Cache has {len(samples) - len(valid)} missing images, refreshing from Hugging Face...")
+                    logger.warning(f"Cache has {len(samples) - len(valid)} missing images, refreshing...")
             except Exception as e:
                 logger.warning(f"Cache load failed, refreshing: {e}")
         
-        # CONFIRMED modern HF mirrors that contain the ACTUAL 100K images.
-        hf_mirrors =[
-            "Mushroomcat/HME100K",    # Highly reliable, full image dataset
-            "OleehyO/HME100K",        # Reliable backup
-            "cyh123/HME100K",         # Alternative backup
-            "opendatalab/HME100K"     # Official OpenDataLab sync
-        ]
+        extract_dir = os.path.join(self.data_dir, "hme100k")
         
-        for mirror in hf_mirrors:
-            try:
-                logger.info(f"Attempting HME100K from confirmed HF mirror: {mirror}")
-                # We pull the HF dataset object
-                hf_dataset = self.downloader.get_hf_dataset(mirror, split="train")
+        logger.info("Attempting to download HME100K from Kaggle mirror (prajwalchy/hme100k-dataset)...")
+        try:
+            # Uses the KAGGLE_API_TOKEN from your environment/config
+            self.downloader.download_kaggle("prajwalchy/hme100k-dataset", extract_dir)
+            
+            logger.info("Parsing HME100K dataset from Kaggle files...")
+            # Uses our new, ultra-robust parser that scans recursively for all images and labels
+            samples = self.parser.parse_hme100k(extract_dir)
+            
+            if samples:
+                self._save_cache(samples, cache_file)
+                logger.info(f"Stage 3b (HME100K) complete: {len(samples)} samples")
+                return samples
+            else:
+                logger.error("HME100K downloaded but no valid samples were found during parsing.")
+                return []
                 
-                if hf_dataset is not None:
-                    extract_dir = os.path.join(self.data_dir, "hme100k")
-                    
-                    # Because HF mirrors format their data natively (image col + text col),
-                    # we can use our extremely robust `parse_mathwriting` method to extract it safely!
-                    samples = self.parser.parse_mathwriting(hf_dataset, extract_dir=extract_dir)
-                    
-                    if samples:
-                        self._save_cache(samples, cache_file)
-                        logger.info(f"Stage 3b (HME100K from HF) complete: {len(samples)} samples")
-                        return samples
-                        
-            except Exception as e:
-                logger.warning(f"HF mirror {mirror} failed: {e}")
-                continue
-        
-        # If all HF mirrors fail, we raise an error instead of returning 0 samples
-        logger.error("Could not load HME100K from ANY confirmed Hugging Face mirrors. Stage 3b will be empty.")
-        return
+        except Exception as e:
+            logger.error(f"Could not load HME100K from Kaggle. Stage 3b will be empty. Error: {e}")
+            return []
 
-    
+
     def get_stage3_combined(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         crohme = self.get_stage3_crohme(force_refresh)
         hme100k = self.get_stage3_hme100k(force_refresh)

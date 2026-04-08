@@ -499,12 +499,14 @@ class DatasetParser:
                 logger.error(f"Could not find text/latex column. Columns: {columns}")
                 return samples
 
-            for idx, item in enumerate(hf_dataset):
+            # THE FIX: Iterate by index to prevent Hugging Face lazy-load crashes
+            for idx in range(len(hf_dataset)):
                 if max_samples and idx >= max_samples:
                     logger.info(f"Reached max_samples limit ({max_samples}). Stopping parse.")
                     break
                     
                 try:
+                    item = hf_dataset[idx]  # If HF crashes decoding this row, it gets caught right here!
                     latex = str(item.get(txt_col, '')).strip()
                     if not latex:
                         continue
@@ -539,8 +541,8 @@ class DatasetParser:
                         elif pil_img:
                             samples.append({"image": pil_img, "latex": latex})
                             
-                except Exception as e:
-                    logger.debug(f"Skipping item {idx} due to error: {e}")
+                except Exception:
+                    # Safely skip the corrupted image
                     continue
                     
         except Exception as e:
@@ -548,6 +550,7 @@ class DatasetParser:
 
         logger.info(f"HF dataset parsing complete: {len(samples)} valid samples found.")
         return samples
+
 
     def parse_hme100k(self, extract_dir: str) -> List[Dict[str, Any]]:
         logger.info(f"Parsing HME100K from {extract_dir}")
