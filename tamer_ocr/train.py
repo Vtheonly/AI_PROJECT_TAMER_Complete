@@ -166,6 +166,7 @@ def load_datasets(config, logger):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='TAMER OCR Training')
+    parser.add_argument('--save-every', type=int, default=None, help='Save and push checkpoint every N epochs')
     parser.add_argument('--datasets', nargs='+', default=None, help='List of datasets to use')
     parser.add_argument('--download', action='store_true', help='Auto-download missing datasets before training')
     parser.add_argument('--prepare-only', action='store_true', help='Download/validate/push datasets, then exit (no training)')
@@ -195,6 +196,7 @@ def main():
     
     config = Config()
     
+    if args.save_every: config.save_every = args.save_every
     if args.datasets: config.datasets = args.datasets
     if args.download: config.auto_download = True
     if args.data_dir: config.data_dir = args.data_dir
