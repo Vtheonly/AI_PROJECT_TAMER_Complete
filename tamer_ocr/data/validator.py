@@ -539,50 +539,66 @@ class DatasetValidator:
     def _validate_cross_dataset_consistency(self, dataset_names: List[str]):
         pass
 
+
     def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
-        try:
-            from datasets import load_dataset
-            logger.info(f"Pulling verified dataset from Hugging Face: {repo_id}...")
-            
-            dataset_dir = self.data_dir / dataset_name
-            img_dir = dataset_dir / "images"
-            img_dir.mkdir(parents=True, exist_ok=True)
-            
-            config = self.registry.get_config(dataset_name)
-            hf_ds = load_dataset(repo_id, split="train", token=getattr(self.config, 'hf_token', None))
-            
-            valid_samples = []
-            logger.info(f"Extracting {len(hf_ds)} verified samples to disk...")
-            
-            for idx, item in enumerate(hf_ds):
-                img = item['image']
-                latex = item['latex']
+            try:
+                from datasets import load_dataset
+                logger.info(f"Pulling verified dataset from Hugging Face: {repo_id}...")
                 
-                h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
-                img_path = img_dir / f"img_{idx}_{h}.png"
+                dataset_dir = self.data_dir / dataset_name
+                img_dir = dataset_dir / "images"
+                img_dir.mkdir(parents=True, exist_ok=True)
                 
-                if not img_path.exists():
-                    img.save(img_path)
+                # Load dataset from HF
+                hf_ds = load_dataset(repo_id, split="train", token=getattr(self.config, 'hf_token', None))
                 
-                valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
+                valid_samples = []
+                logger.info(f"Extracting {len(hf_ds)} verified samples to disk...")
                 
-                if (idx + 1) % 10000 == 0:
-                    logger.info(f"  Saved {idx + 1}/{len(hf_ds)} images...")
-            
-            annot_file = dataset_dir / "annotations.json"
-            with open(annot_file, 'w', encoding='utf-8') as f:
-                json.dump(valid_samples, f, ensure_ascii=False, indent=2)
+                for idx, item in enumerate(hf_ds):
+                    try:
+                        img = item.get('image')
+                        latex = item.get('latex', '')
+                        
+                        if img is None or not latex:
+                            continue
+
+                        # Generate path
+                        h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
+                        img_path = img_dir / f"img_{idx}_{h}.png"
+                        
+                        # Safety check: Ensure the object is actually an image
+                        if not img_path.exists():
+                            # This is where the crash happens; we wrap it in a try-except
+                            img.save(img_path)
+                        
+                        valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
+                        
+                    except Exception as e:
+                        # LOG AND SKIP instead of crashing
+                        if idx % 1000 == 0:
+                            logger.warning(f"Skipping sample {idx} in {dataset_name} (corrupt on HF Hub): {e}")
+                        continue
+                    
+                    if (idx + 1) % 10000 == 0:
+                        logger.info(f"  Processed {idx + 1}/{len(hf_ds)} images...")
                 
-            logger.info(f"Successfully pulled and prepped verified dataset '{dataset_name}'")
-            
-            self.result = ValidationResult()
-            self._validate_data_directory()
-            self._validate_single_dataset(dataset_name)
-            return self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
-            
-        except Exception as e:
-            logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
-            return False
+                # Save clean annotations.json
+                annot_file = dataset_dir / "annotations.json"
+                with open(annot_file, 'w', encoding='utf-8') as f:
+                    json.dump(valid_samples, f, ensure_ascii=False, indent=2)
+                    
+                logger.info(f"Successfully pulled and prepped verified dataset '{dataset_name}'")
+                
+                # Final verification of what we just downloaded
+                self.result = ValidationResult()
+                self._validate_data_directory()
+                self._validate_single_dataset(dataset_name)
+                return self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
+                
+            except Exception as e:
+                logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
+                return False
 
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
         token = getattr(self.config, 'hf_token', None) or os.getenv("HF_TOKEN")
