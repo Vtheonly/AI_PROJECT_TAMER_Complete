@@ -249,17 +249,18 @@ class DatasetParser:
 
 
 
+
+
+
     def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
             logger.info(f"Deep-Parsing CROHME from {extract_dir}")
             samples = []
             image_map = {}
-            # 1. Catalog every image in the 1.7GB folder
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith(self.IMG_EXTENSIONS):
                         image_map[os.path.splitext(f)[0]] = os.path.join(root, f)
 
-            # 2. Match them against any .txt files found
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith('.txt') and 'readme' not in f.lower():
@@ -280,15 +281,20 @@ class DatasetParser:
         image_map = {os.path.splitext(f)[0]: os.path.join(r, f) 
                      for r, _, fs in os.walk(extract_dir) for f in fs if f.lower().endswith(self.IMG_EXTENSIONS)}
         
+        # Check standard HME100K label file names
         for label_file in ['labels.txt', 'train_labels.txt', 'test_labels.txt']:
-            path = self._find_label_file(extract_dir, [label_file])
-            if path:
-                with open(path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        parts = line.strip().split(' ', 1)
-                        if len(parts) == 2 and parts[0] in image_map:
-                            samples.append({"image": image_map[parts[0]], "latex": parts[1]})
+            for root, _, files in os.walk(extract_dir):
+                if label_file in files:
+                    with open(os.path.join(root, label_file), 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split(' ', 1)
+                            if len(parts) == 2 and parts[0] in image_map:
+                                samples.append({"image": image_map[parts[0]], "latex": parts[1]})
         return samples
+
+
+
+
 
 
   
