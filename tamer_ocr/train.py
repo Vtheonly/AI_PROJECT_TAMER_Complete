@@ -58,8 +58,18 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, config, device,
         epoch_cov += cov_loss.item()
         
         if batch_idx % 50 == 0:
+            mem_msg = ""
+            if torch.cuda.is_available() and device.type == "cuda":
+                try:
+                    alloc_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+                    reserv_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+                    max_alloc_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    mem_msg = f" | CUDA(MB) alloc={alloc_mb:.0f} reserv={reserv_mb:.0f} max_alloc={max_alloc_mb:.0f}"
+                except Exception:
+                    pass
             logger.info(f"Epoch [{epoch}] Batch [{batch_idx}/{len(loader)}] - "
-                        f"Loss: {loss.item():.4f} (Seq: {seq_loss.item():.4f}, Ptr: {ptr_loss.item():.4f})")
+                        f"Loss: {loss.item():.4f} (Seq: {seq_loss.item():.4f}, Ptr: {ptr_loss.item():.4f}, Cov: {cov_loss.item():.4f})"
+                        f"{mem_msg}")
                         
     return epoch_loss / len(loader)
 
@@ -158,6 +168,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='TAMER OCR Training')
     parser.add_argument('--datasets', nargs='+', default=None, help='List of datasets to use')
     parser.add_argument('--download', action='store_true', help='Auto-download missing datasets before training')
+    parser.add_argument('--prepare-only', action='store_true', help='Download/validate/push datasets, then exit (no training)')
     parser.add_argument('--data-dir', type=str, default=None, help='Override data directory path')
     parser.add_argument('--list-datasets', action='store_true', help='List available datasets and exit')
     parser.add_argument('--batch-size', type=int, default=None, help='Training batch size')
@@ -194,6 +205,34 @@ def main():
     logger = setup_logger("TAMER", config.log_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Initialized TAMER Pipeline on device: {device}")
+
+    if args.prepare_only:
+        logger.info("=" * 60)
+        logger.info("PREPARE-ONLY MODE (no training)")
+        logger.info("=" * 60)
+        from data.validator import DatasetValidator
+        from data.datasets_registry import list_available_datasets
+
+        validator = DatasetValidator(config)
+        datasets = config.datasets if config.datasets else [d for d in list_available_datasets() if d != "custom"]
+        logger.info(f"Preparing datasets: {datasets}")
+
+        ok_all = True
+        for dataset_name in datasets:
+            if dataset_name == "custom":
+                continue
+            if not validator.registry.validate_dataset_name(dataset_name):
+                ok_all = False
+                continue
+            logger.info(f"Preparing dataset: {dataset_name}")
+            ok = validator.try_download_and_validate(dataset_name)
+            ok_all = ok_all and ok
+
+        if ok_all:
+            logger.info("All requested datasets prepared (downloaded/validated/pushed if configured). Exiting.")
+            sys.exit(0)
+        logger.error("One or more datasets failed to prepare. Exiting with error.")
+        sys.exit(1)
     
     if not config.skip_validation:
         logger.info("=" * 60)

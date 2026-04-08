@@ -585,13 +585,14 @@ class DatasetValidator:
             return False
 
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
-        if not getattr(self.config, 'hf_token', None):
-            logger.info("No hf_token provided. Skipping push of verified dataset.")
+        token = getattr(self.config, 'hf_token', None) or os.getenv("HF_TOKEN")
+        if not token:
+            logger.info("No Hugging Face token provided. Skipping push of verified dataset.")
             return
-            
+
         try:
             from datasets import Dataset, Image as HFImage
-            from huggingface_hub import HfApi, login
+            from huggingface_hub import HfApi
             
             annot_file = dataset_dir / "annotations.json"
             if not annot_file.exists():
@@ -599,15 +600,19 @@ class DatasetValidator:
                 
             with open(annot_file, 'r', encoding='utf-8') as f:
                 annotations = json.load(f)
-                
-            login(token=self.config.hf_token)
-            api = HfApi()
-            
-            username = api.whoami()['name']
+
+            api = HfApi(token=token)
+            try:
+                username = api.whoami()["name"]
+            except Exception:
+                # Token invalid / network issue: don't crash training or preparation.
+                logger.warning("Hugging Face auth check failed. Skipping push of verified dataset.")
+                return
+
             base_repo = getattr(self.config, 'hf_dataset_repo', 'Verified-Datasets')
-            if '/' not in base_repo:
+            if "/" not in base_repo:
                 base_repo = f"{username}/{base_repo}"
-                
+
             repo_id = f"{base_repo}-{dataset_name}"
             
             logger.info(f"Checking Hugging Face repository: {repo_id}")
@@ -620,21 +625,28 @@ class DatasetValidator:
                 pass
                 
             logger.info(f"Uploading verified dataset '{dataset_name}' to {repo_id}...")
-            
-            images = []
-            texts = []
-            for ann in annotations:
-                img_path = str(ann['image_path'])
-                if os.path.exists(img_path):
-                    images.append(img_path)
-                    texts.append(ann['latex'])
-                    
-            if not images:
-                logger.warning("No valid images found to push.")
+
+            # Use generator to avoid loading all paths/strings into RAM at once.
+            def gen():
+                if isinstance(annotations, dict) and "samples" in annotations:
+                    items = annotations["samples"]
+                else:
+                    items = annotations
+                for ann in items:
+                    try:
+                        img_path = str(ann["image_path"])
+                        latex = ann["latex"]
+                    except Exception:
+                        continue
+                    if img_path and latex and os.path.exists(img_path):
+                        yield {"image": img_path, "latex": latex}
+
+            hf_ds = Dataset.from_generator(gen).cast_column("image", HFImage())
+            if len(hf_ds) == 0:
+                logger.warning("No valid samples found to push.")
                 return
-                
-            hf_ds = Dataset.from_dict({"image": images, "latex": texts}).cast_column("image", HFImage())
-            hf_ds.push_to_hub(repo_id, private=True, token=self.config.hf_token)
+
+            hf_ds.push_to_hub(repo_id, private=True, token=token)
             logger.info(f"Successfully pushed verified dataset '{dataset_name}' to HF Hub!")
             
         except ImportError:
