@@ -292,7 +292,7 @@ def main():
         
         if (epoch + 1) % config.eval_every == 0:
             metrics = validate(model, train_loader, tokenizer, grammar, config, device, logger)
-            is_best = metrics['exact'] > best_exprate
+            is_best = metrics.get('exact', 0.0) > best_exprate
             if is_best:
                 best_exprate = metrics['exact']
                 best_path = os.path.join(config.checkpoint_dir, 'best.pt')
@@ -304,6 +304,11 @@ def main():
             metrics_dict = metrics if 'metrics' in locals() else {}
             save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics_dict, latest_path)
             push_checkpoint_to_hf(latest_path, config, epoch + 1, is_best=False)
+            
+        # VERY IMPORTANT: Prevent silent crashes by clearing GPU memory
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
 
 if __name__ == "__main__":
     main()

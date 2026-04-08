@@ -1,8 +1,7 @@
 import os
 import torch
-import json
 import logging
-from huggingface_hub import HfApi, login
+from huggingface_hub import HfApi
 
 logger = logging.getLogger("TAMER.Checkpoint")
 
@@ -13,44 +12,48 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, path):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'metrics': metrics  # <-- This contains your "gains"
+            'metrics': metrics
         }, path)
         logger.info(f"Checkpoint saved locally to {path}")
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
 
 def push_checkpoint_to_hf(checkpoint_path, config, epoch, is_best=False):
-    """Pushes a local checkpoint to Hugging Face Hub."""
+    """Pushes a local checkpoint to Hugging Face Hub flawlessly."""
     if not config.hf_repo_id:
         logger.warning("hf_repo_id is not set. Skipping Hugging Face upload.")
         return
 
-    if not config.hf_token:
+    # Use explicitly passed token or fallback to environment
+    hf_token = getattr(config, 'hf_token', None) or os.getenv("HF_TOKEN")
+    if not hf_token:
         logger.warning("hf_token is not set. Skipping Hugging Face upload.")
         return
 
     try:
-        # Authenticate with Hugging Face
-        login(token=config.hf_token)
-        api = HfApi()
+        api = HfApi(token=hf_token)
+        
+        # Auto-resolve username if user only provided a repo name (e.g. "TAMER-Checkpoints")
+        repo_id = config.hf_repo_id
+        if '/' not in repo_id:
+            username = api.whoami()['name']
+            repo_id = f"{username}/{repo_id}"
 
-        # Ensure the repository exists (creates it if it doesn't, sets it to private)
-        api.create_repo(repo_id=config.hf_repo_id, exist_ok=True, repo_type="model", private=True)
+        # Ensure the repository exists
+        api.create_repo(repo_id=repo_id, exist_ok=True, repo_type="model", private=True)
 
-        # Name the file on Hugging Face
         remote_file_name = "best.pt" if is_best else f"checkpoint_epoch_{epoch}.pt"
-
-        logger.info(f"Uploading {remote_file_name} to Hugging Face Hub ({config.hf_repo_id})...")
+        logger.info(f"Uploading {remote_file_name} to Hugging Face Hub ({repo_id})...")
 
         api.upload_file(
             path_or_fileobj=checkpoint_path,
             path_in_repo=remote_file_name,
-            repo_id=config.hf_repo_id,
+            repo_id=repo_id,
             repo_type="model"
         )
-        logger.info(f"Successfully pushed {remote_file_name} to Hugging Face.")
+        logger.info(f"✅ Successfully pushed {remote_file_name} to Hugging Face.")
     except Exception as e:
-        logger.error(f"Failed to push checkpoint to Hugging Face: {e}")
+        logger.error(f"❌ Failed to push checkpoint to Hugging Face: {e}")
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, device='cpu'):
     if not os.path.exists(path):
