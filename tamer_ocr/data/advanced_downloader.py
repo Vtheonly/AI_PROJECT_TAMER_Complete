@@ -202,39 +202,41 @@ class AdvDownloader:
     # -----------------------------------------------------------------
     # Kaggle Download
     # -----------------------------------------------------------------
+
+# -----------------------------------------------------------------
+    # Kaggle Download
+    # -----------------------------------------------------------------
     def download_kaggle(self, dataset_identifier: str, extract_dir: str):
-        """
-        Download a dataset via the Kaggle API.
-        
-        Args:
-            dataset_identifier: Kaggle dataset identifier (e.g., "user/dataset-name")
-            extract_dir: Directory to extract files to
-            
-        Raises:
-            ValueError: If Kaggle credentials are missing
-            DownloadError: If download fails
-        """
         if self._is_extracted(extract_dir, required_min_files=10):
             logger.info(f"Kaggle dataset already extracted at {extract_dir}")
             return
             
-        # Check for authentication - new token or old username/key
-        kaggle_api_token = self.kaggle_api_token or os.getenv('KAGGLE_API_TOKEN', '')
-        kaggle_username = getattr(self, 'kaggle_username', '') or os.getenv('KAGGLE_USERNAME', '')
-        kaggle_key = getattr(self, 'kaggle_key', '') or os.getenv('KAGGLE_KEY', '')
+        # --- NEW AUTO-KAGGLE LOGIN FIX ---
+        # Automatically look for kaggle.json in the data/ folder!
+        kaggle_json_path = Path(getattr(self.config, 'data_dir', './data')) / 'kaggle.json'
         
-        if not kaggle_api_token and not (kaggle_username and kaggle_key):
+        if kaggle_json_path.exists():
+            import json
+            try:
+                with open(kaggle_json_path, 'r') as f:
+                    creds = json.load(f)
+                    os.environ['KAGGLE_USERNAME'] = creds.get('username', '')
+                    os.environ['KAGGLE_KEY'] = creds.get('key', '')
+                logger.info("Successfully loaded Kaggle credentials directly from data/kaggle.json!")
+            except Exception as e:
+                logger.error(f"Found kaggle.json but failed to parse it: {e}")
+
+        # Check if the environment variables are now set
+        kaggle_username = os.getenv('KAGGLE_USERNAME', '')
+        kaggle_key = os.getenv('KAGGLE_KEY', '')
+        
+        if not (kaggle_username and kaggle_key):
             error_msg = (
-                "Missing Kaggle Credentials. Authentication is required to download datasets from Kaggle.\n"
-                "To set up Kaggle credentials (NEW METHOD - recommended):\n"
-                "  1. Go to https://www.kaggle.com/settings/account\n"
-                "  2. Click 'Create New API Token'\n"
-                "  3. Set environment variable:\n"
-                "     export KAGGLE_API_TOKEN=<your-token>\n"
-                "  4. Or add kaggle_api_token to your config object.\n\n"
-                "Alternatively (OLD METHOD - deprecated):\n"
-                "  - Place the kaggle.json file at ~/.kaggle/kaggle.json\n"
-                "  - Or set KAGGLE_USERNAME and KAGGLE_KEY environment variables"
+                "Missing Kaggle Credentials!\n"
+                "1. Go to Kaggle.com -> Settings -> 'Create New Token'\n"
+                "2. Download the 'kaggle.json' file.\n"
+                f"3. Drag and drop it directly into this folder: {kaggle_json_path.parent}/\n"
+                "4. Run the script again!"
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
@@ -260,7 +262,6 @@ class AdvDownloader:
         except Exception as e:
             logger.error(f"Kaggle download failed: {e}")
             raise DownloadError(f"Kaggle download failed: {e}")
-
     # -----------------------------------------------------------------
     # Zenodo ZIP Download
     # -----------------------------------------------------------------
