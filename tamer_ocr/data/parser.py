@@ -60,73 +60,6 @@ class DatasetParser:
             return True
         return False
 
-    def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
-        logger.info(f"Parsing CROHME from {extract_dir}")
-        samples = []
-
-        if not os.path.exists(extract_dir):
-            logger.error(f"CROHME directory not found: {extract_dir}")
-            return samples
-
-        label_files = []
-        for root, dirs, files in os.walk(extract_dir):
-            for f in files:
-                if f.lower().endswith('.txt'):
-                    label_files.append(os.path.join(root, f))
-
-        matched = 0
-        for label_file in label_files:
-            label_dir = os.path.dirname(label_file)
-            try:
-                with open(label_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = line.split('\t')
-                        if len(parts) >= 2:
-                            img_name = parts[0].strip()
-                            latex = parts[1].strip()
-                        else:
-                            img_name = line.split()[0] if line.split() else line
-                            latex = ' '.join(line.split()[1:]) if len(line.split()) > 1 else line
-
-                        img_path = self._find_matching_image(label_dir, img_name)
-                        if img_path and latex:
-                            samples.append({"image": img_path, "latex": latex})
-                            matched += 1
-            except Exception as e:
-                logger.warning(f"Error parsing label file {label_file}: {e}")
-
-        if matched == 0:
-            images = self._find_images(extract_dir)
-            images = [img for img in images if not img.lower().endswith('.inkml')]
-            
-            for img_path in images:
-                base = os.path.splitext(img_path)[0]
-                txt_path = base + ".txt"
-                if os.path.exists(txt_path):
-                    latex = self._safe_read_latex(txt_path)
-                    if latex and self._validate_sample(img_path, latex):
-                        samples.append({"image": img_path, "latex": latex})
-                        matched += 1
-                else:
-                    for root, dirs, files in os.walk(extract_dir):
-                        for f in files:
-                            if f.lower().endswith('.txt') and os.path.splitext(f)[0].lower() == os.path.splitext(os.path.basename(img_path))[0].lower():
-                                txt_path = os.path.join(root, f)
-                                latex = self._safe_read_latex(txt_path)
-                                if latex and self._validate_sample(img_path, latex):
-                                    samples.append({"image": img_path, "latex": latex})
-                                    matched += 1
-                                break
-
-        if matched == 0:
-            samples.extend(self._parse_annotations_json(extract_dir))
-            matched = len(samples)
-
-        logger.info(f"CROHME parsed: {matched} valid samples found.")
-        return samples
 
     def _find_matching_image(self, search_dir: str, img_name: str) -> Optional[str]:
         if not img_name:
@@ -304,25 +237,53 @@ class DatasetParser:
         return samples
 
     def _find_image_directory(self, base_dir: str) -> str:
-        candidate_names = ['images', 'formula_images', 'img', 'train_images', 'test_images', 
-                         'val_images', 'im2latex_images']
-        
-        for name in candidate_names:
-            path = os.path.join(base_dir, name)
-            if os.path.isdir(path):
-                return path
-        
+        """Deep search for the folder containing the most images."""
+        best_dir = base_dir
+        max_imgs = -1
         for root, dirs, files in os.walk(base_dir):
-            for d in dirs:
-                if d.lower() in candidate_names:
-                    return os.path.join(root, d)
-        
-        for root, dirs, files in os.walk(base_dir):
-            if any(f.lower().endswith(('.png', '.jpg', '.jpeg')) for f in files):
-                return root
-        
-        return base_dir
+            count = sum(1 for f in files if f.lower().endswith(self.IMG_EXTENSIONS))
+            if count > max_imgs:
+                max_imgs = count
+                best_dir = root
+        return best_dir
 
+    def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
+        logger.info(f"Deep-Parsing CROHME from {extract_dir}")
+        samples = []
+        
+        # 1. Find all .txt files anywhere in the directory tree
+        label_map = {}
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith('.txt') and f.lower() != 'readme.txt':
+                    full_path = os.path.join(root, f)
+                    try:
+                        with open(full_path, 'r', encoding='utf-8', errors='ignore') as tf:
+                            for line in tf:
+                                parts = line.strip().split('\t')
+                                if len(parts) >= 2:
+                                    label_map[parts[0].strip()] = parts[1].strip()
+                    except: continue
+
+        # 2. Find all images anywhere in the tree and match them
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith(self.IMG_EXTENSIONS):
+                    name_no_ext = os.path.splitext(f)[0]
+                    if name_no_ext in label_map:
+                        samples.append({
+                            "image": os.path.join(root, f),
+                            "latex": label_map[name_no_ext]
+                        })
+        
+        # 3. Fallback: If still 0, look for .inkml files transformed to png
+        if not samples:
+            samples.extend(self._parse_annotations_json(extract_dir))
+
+        logger.info(f"CROHME Deep-Parse: {len(samples)} valid samples found.")
+        return samples
+    
+    
     def _find_image_file(self, img_name: str, img_dir: str, base_dir: str) -> Optional[str]:
         if not img_name:
             return None

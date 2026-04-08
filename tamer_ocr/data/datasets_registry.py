@@ -105,7 +105,7 @@ class DatasetRegistry:
             annotations_file="annotations.json",
             expected_sample_count=10000,
             min_sample_count=100,
-            required_directories=["images"],
+            required_directories=[],
             source_url="https://zenodo.org/records/8428035/files/CROHME23.zip?download=1",
             license="Academic",
         ),
@@ -118,7 +118,7 @@ class DatasetRegistry:
             annotations_file="annotations.json",
             expected_sample_count=100000,
             min_sample_count=100, # CHANGED: Lowered so missing GH files don't block run
-            required_directories=["images"],
+            required_directories=[],
             source_url="https://github.com/Phymond/HME100K",
             license="Academic",
         ),
