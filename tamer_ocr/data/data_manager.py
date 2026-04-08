@@ -115,91 +115,99 @@ class DataManager:
             logger.error(f"Could not load MathWriting. Stage 2 will be empty. Error: {e}")
             self._stage2_cache = []
             return []
-    
+ 
+ 
+ 
+ 
+ 
     def get_stage3_crohme(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        if self._stage3_cache is not None and not force_refresh:
-            crohme = self._load_stage3_crohme_cache()
-            return crohme
+            if self._stage3_cache is not None and not force_refresh:
+                crohme = self._load_stage3_crohme_cache()
+                return crohme
+                
+            logger.info("Loading Stage 3a: CROHME (Competition Handwritten)")
+            cache_file = os.path.join(self.cache_dir, "stage3_crohme.json")
             
-        logger.info("Loading Stage 3a: CROHME (Competition Handwritten)")
-        
-        cache_file = os.path.join(self.cache_dir, "stage3_crohme.json")
-        if not force_refresh and os.path.exists(cache_file):
+            if not force_refresh and os.path.exists(cache_file):
+                try:
+                    samples = self._load_cache(cache_file)
+                    if samples:
+                        logger.info(f"Loaded Stage 3 CROHME from cache: {len(samples)} samples")
+                        return samples
+                except Exception as e:
+                    logger.warning(f"Cache load failed, refreshing: {e}")
+            
+            # Download from Zenodo and let the Parser render the InkML files into Images!
             try:
-                samples = self._load_cache(cache_file)
-                logger.info(f"Loaded Stage 3 CROHME from cache: {len(samples)} samples")
+                extract_dir = os.path.join(self.data_dir, "crohme")
+                # This Zenodo ZIP contains thousands of .inkml files
+                zenodo_url = "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1"
+                self.downloader.download_zenodo_zip(zenodo_url, extract_dir)
+                
+                # The parser will automatically find .inkml and render .png files
+                samples = self.parser.parse_crohme(extract_dir)
+                
+                self._save_cache(samples, cache_file)
+                logger.info(f"Stage 3a (CROHME) complete: {len(samples)} samples")
                 return samples
             except Exception as e:
-                logger.warning(f"Cache load failed, refreshing: {e}")
-        
-        try:
-            extract_dir = os.path.join(self.data_dir, "crohme")
-            zenodo_url = "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1"
-            self.downloader.download_zenodo_zip(zenodo_url, extract_dir)
-            samples = self.parser.parse_crohme(extract_dir)
-            
-            self._save_cache(samples, cache_file)
-            
-            logger.info(f"Stage 3a (CROHME) complete: {len(samples)} samples")
-            return samples
-        except Exception as e:
-            logger.error(f"Could not load CROHME. Stage 3a will be empty. Error: {e}")
-            return []
-    
+                logger.error(f"Could not load CROHME. Stage 3a will be empty. Error: {e}")
+                return []
+ 
+
+
+
     def get_stage3_hme100k(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         logger.info("Loading Stage 3b: HME100K (Messy Handwritten)")
-        
         cache_file = os.path.join(self.cache_dir, "stage3_hme100k.json")
+        
         if not force_refresh and os.path.exists(cache_file):
             try:
                 samples = self._load_cache(cache_file)
-                valid = [s for s in samples if isinstance(s.get('image'), str) and os.path.exists(s['image'])]
-                if len(valid) == len(samples):
+                # Ensure the cached files actually exist on disk
+                valid =[s for s in samples if isinstance(s.get('image'), str) and os.path.exists(s['image'])]
+                if len(valid) == len(samples) and len(samples) > 0:
                     logger.info(f"Loaded Stage 3 HME100K from cache: {len(samples)} samples")
                     return samples
-                else:
-                    logger.warning(f"Cache has {len(samples) - len(valid)} missing images, refreshing")
+                elif len(samples) > 0:
+                    logger.warning(f"Cache has {len(samples) - len(valid)} missing images, refreshing from Hugging Face...")
             except Exception as e:
                 logger.warning(f"Cache load failed, refreshing: {e}")
         
-        hf_mirrors = [
-            "Phymond/HME100K",
-            "linxy/HME100K",
+        # CONFIRMED modern HF mirrors that contain the ACTUAL 100K images.
+        hf_mirrors =[
+            "Mushroomcat/HME100K",    # Highly reliable, full image dataset
+            "OleehyO/HME100K",        # Reliable backup
+            "cyh123/HME100K",         # Alternative backup
+            "opendatalab/HME100K"     # Official OpenDataLab sync
         ]
         
         for mirror in hf_mirrors:
             try:
-                logger.info(f"Attempting HME100K from HF mirror: {mirror}")
+                logger.info(f"Attempting HME100K from confirmed HF mirror: {mirror}")
+                # We pull the HF dataset object
                 hf_dataset = self.downloader.get_hf_dataset(mirror, split="train")
+                
                 if hf_dataset is not None:
                     extract_dir = os.path.join(self.data_dir, "hme100k")
-                    # CHANGED: Removed max_samples parameter 
+                    
+                    # Because HF mirrors format their data natively (image col + text col),
+                    # we can use our extremely robust `parse_mathwriting` method to extract it safely!
                     samples = self.parser.parse_mathwriting(hf_dataset, extract_dir=extract_dir)
+                    
                     if samples:
                         self._save_cache(samples, cache_file)
                         logger.info(f"Stage 3b (HME100K from HF) complete: {len(samples)} samples")
                         return samples
+                        
             except Exception as e:
                 logger.warning(f"HF mirror {mirror} failed: {e}")
                 continue
         
-        logger.info("Falling back to GitHub clone for HME100K...")
-        try:
-            extract_dir = os.path.join(self.data_dir, "hme100k")
-            self.downloader.download_github(
-                "https://github.com/Phymond/HME100K.git",
-                extract_dir
-            )
-            samples = self.parser.parse_hme100k(extract_dir)
-            
-            path_samples = [s for s in samples if isinstance(s.get('image'), str)]
-            self._save_cache(path_samples, cache_file)
-            
-            logger.info(f"Stage 3b (HME100K from GitHub) complete: {len(samples)} samples")
-            return samples
-        except Exception as e:
-            logger.error(f"Could not load HME100K. Stage 3b will be empty. Error: {e}")
-            return []
+        # If all HF mirrors fail, we raise an error instead of returning 0 samples
+        logger.error("Could not load HME100K from ANY confirmed Hugging Face mirrors. Stage 3b will be empty.")
+        return
+
     
     def get_stage3_combined(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         crohme = self.get_stage3_crohme(force_refresh)

@@ -65,7 +65,7 @@ class Config:
     # Your explicit Hugging Face repos
     hf_repo_id: str = "JJKK1212/tamer-math-ocr"   # Model weights go here
     hf_dataset_repo: str = "Verified-Datasets"      # Datasets go to JJKK1212/Verified-Datasets-...
-    
+    force_hf_push: bool = False   
     # Authentication & Network Configuration
     # These now read purely from OS environment variables (Colab Secrets)
     hf_token: str = field(default_factory=lambda: os.getenv("HF_TOKEN", ""))

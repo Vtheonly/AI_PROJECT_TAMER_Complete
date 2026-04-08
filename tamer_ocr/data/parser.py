@@ -10,12 +10,95 @@ from typing import List, Dict, Any, Optional
 from pathlib import Path
 from PIL import Image
 import csv
+import xml.etree.ElementTree as ET  # <--- NEW IMPORT
+from PIL import Image, ImageDraw    # <--- NEW IMPORT
+
 
 logger = logging.getLogger("TAMER.Parser")
 
 
 class DatasetParser:
     IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp')
+
+
+
+    def _render_inkml(self, inkml_path: str, output_img_path: str, line_width: int = 3) -> Optional[str]:
+        """Parses an .inkml file, renders pen strokes to a PNG, and returns the LaTeX truth."""
+        try:
+            tree = ET.parse(inkml_path)
+            root = tree.getroot()
+            
+            # Helper to ignore XML namespaces
+            def strip_ns(tag):
+                return tag.split('}', 1)[-1] if '}' in tag else tag
+
+            latex_truth = ""
+            traces = []
+
+            for elem in root.iter():
+                tag = strip_ns(elem.tag)
+                
+                # 1. Extract LaTeX ground truth
+                if tag == 'annotation' and elem.attrib.get('type') == 'truth':
+                    if elem.text:
+                        latex_truth = elem.text.strip()
+                
+                # 2. Extract pen strokes (traces)
+                elif tag == 'trace':
+                    if not elem.text: continue
+                    coords = elem.text.strip().split(',')
+                    stroke = []
+                    for coord in coords:
+                        vals = coord.strip().split()
+                        if len(vals) >= 2:
+                            try:
+                                stroke.append((float(vals[0]), float(vals[1])))
+                            except ValueError:
+                                continue
+                    if stroke:
+                        traces.append(stroke)
+
+            if not traces or not latex_truth:
+                return None
+
+            # 3. Compute Bounding Box
+            all_x = [pt[0] for stroke in traces for pt in stroke]
+            all_y = [pt[1] for stroke in traces for pt in stroke]
+            min_x, max_x = min(all_x), max(all_x)
+            min_y, max_y = min(all_y), max(all_y)
+            
+            width = max(max_x - min_x, 1)
+            height = max(max_y - min_y, 1)
+
+            # 4. Normalize scale and render (keeps math symbols looking natural)
+            padding = 20
+            scale = 200.0 / height  # Scale handwriting to a fixed 200px height
+            
+            img_w = int(width * scale) + padding * 2
+            img_h = int(height * scale) + padding * 2
+
+            # White background
+            img = Image.new('L', (img_w, img_h), color=255)
+            draw = ImageDraw.Draw(img)
+
+            # Draw smooth black strokes
+            for stroke in traces:
+                scaled_stroke = [(int((pt[0] - min_x) * scale) + padding, 
+                                  int((pt[1] - min_y) * scale) + padding) for pt in stroke]
+                if len(scaled_stroke) > 1:
+                    draw.line(scaled_stroke, fill=0, width=line_width, joint='curve')
+                elif len(scaled_stroke) == 1: # Draw dot
+                    pt = scaled_stroke[0]
+                    draw.ellipse([pt[0]-line_width, pt[1]-line_width, 
+                                  pt[0]+line_width, pt[1]+line_width], fill=0)
+
+            img.save(output_img_path)
+            return latex_truth
+
+        except Exception as e:
+            logger.debug(f"Failed to render InkML {inkml_path}: {e}")
+            return None
+
 
     def _find_images(self, root_dir: str) -> List[str]:
         images = []
@@ -252,59 +335,110 @@ class DatasetParser:
 
 
 
-
-
-
-
     def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
-            logger.info(f"Power-Parsing CROHME from {extract_dir}")
-            samples = []
-            image_map = {}
-            # 1. Find EVERY image in the 1.7GB folder tree
-            for root, _, files in os.walk(extract_dir):
-                for f in files:
-                    if f.lower().endswith(self.IMG_EXTENSIONS):
-                        image_map[os.path.splitext(f)[0].lower()] = os.path.join(root, f)
+        logger.info(f"Power-Parsing CROHME from {extract_dir}")
+        samples = []
+        
+        # Look for existing images first
+        image_map = {}
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith(self.IMG_EXTENSIONS):
+                    image_map[os.path.splitext(f)[0].lower()] = os.path.join(root, f)
 
-            # 2. Find EVERY .txt file and match against images
-            for root, _, files in os.walk(extract_dir):
-                for f in files:
-                    if f.lower().endswith('.txt') and 'readme' not in f.lower():
-                        try:
-                            with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as tf:
-                                for line in tf:
-                                    line = line.strip()
-                                    if not line: continue
-                                    # Split by Tab or Space
-                                    parts = line.split('\t') if '\t' in line else line.split(' ', 1)
-                                    if len(parts) < 2: continue
-                                    
-                                    img_id = os.path.splitext(parts[0].strip())[0].lower()
-                                    latex = parts[1].strip()
-                                    if img_id in image_map:
-                                        samples.append({"image": image_map[img_id], "latex": latex})
-                        except: continue
-            logger.info(f"Matched {len(samples)} CROHME samples.")
+        # Look for .inkml files to render
+        inkml_files = []
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith('.inkml'):
+                    inkml_files.append(os.path.join(root, f))
+
+        # If we have .inkml files, render them directly!
+        if inkml_files:
+            logger.info(f"Found {len(inkml_files)} .inkml files. Rendering to high-quality PNGs...")
+            img_out_dir = os.path.join(extract_dir, "images")
+            os.makedirs(img_out_dir, exist_ok=True)
+            
+            rendered_count = 0
+            for idx, inkml_path in enumerate(inkml_files):
+                base_name = os.path.splitext(os.path.basename(inkml_path))[0]
+                out_img = os.path.join(img_out_dir, f"{base_name}.png")
+                
+                # Render the image and extract the embedded LaTeX truth
+                latex = self._render_inkml(inkml_path, out_img)
+                
+                if latex and os.path.exists(out_img):
+                    samples.append({"image": out_img, "latex": latex})
+                    rendered_count += 1
+                    
+                if (idx + 1) % 1000 == 0:
+                    logger.info(f"  Rendered {idx + 1}/{len(inkml_files)} CROHME files...")
+                    
+            logger.info(f"Successfully rendered {rendered_count} CROHME images from InkML.")
             return samples
+
+        # --- FALLBACK: If user provided a dataset that already has text mappings ---
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                f_lower = f.lower()
+                if f_lower.endswith('.txt') or 'label' in f_lower or 'truth' in f_lower or 'gt' in f_lower:
+                    if 'readme' in f_lower: continue
+                    try:
+                        with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as tf:
+                            for line in tf:
+                                line = line.strip()
+                                if not line: continue
+                                parts = line.split('\t') if '\t' in line else line.split(' ', 1)
+                                if len(parts) < 2: continue
+                                
+                                img_id = os.path.splitext(parts[0].strip())[0].lower()
+                                latex = parts[-1].strip()
+                                if img_id in image_map:
+                                    samples.append({"image": image_map[img_id], "latex": latex})
+                    except Exception: continue
+                    
+        unique_samples = list({s['image']: s for s in samples}.values())
+        logger.info(f"Matched {len(unique_samples)} CROHME samples.")
+        return unique_samples
+
+
+
 
     def parse_hme100k(self, extract_dir: str) -> List[Dict[str, Any]]:
         logger.info(f"Power-Parsing HME100K from {extract_dir}")
         samples = []
-        image_map = {os.path.splitext(f)[0].lower(): os.path.join(r, f) 
-                     for r, _, fs in os.walk(extract_dir) for f in fs if f.lower().endswith(self.IMG_EXTENSIONS)}
-        
-        # Check for any .txt file in the HME100K folder
+        image_map = {}
         for root, _, files in os.walk(extract_dir):
             for f in files:
-                if f.lower().endswith('.txt'):
-                    with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as label_f:
-                        for line in label_f:
-                            parts = line.strip().split(' ', 1)
-                            if len(parts) == 2:
-                                img_id = os.path.splitext(parts[0])[0].lower()
-                                if img_id in image_map:
-                                    samples.append({"image": image_map[img_id], "latex": parts[1]})
-        return samples
+                if f.lower().endswith(self.IMG_EXTENSIONS):
+                    image_map[os.path.splitext(f)[0].lower()] = os.path.join(root, f)
+        
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                f_lower = f.lower()
+                if f_lower.endswith('.txt') or 'label' in f_lower:
+                    if 'readme' in f_lower: continue
+                    try:
+                        with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as label_f:
+                            for line in label_f:
+                                line = line.strip()
+                                if not line: continue
+                                parts = line.split('\t') if '\t' in line else line.split(' ', 1)
+                                if len(parts) >= 2:
+                                    img_id = os.path.splitext(parts[0].strip())[0].lower()
+                                    latex = parts[-1].strip()
+                                    if img_id in image_map:
+                                        samples.append({"image": image_map[img_id], "latex": latex})
+                    except Exception:
+                        continue
+                        
+        # Remove duplicates
+        unique_samples = list({s['image']: s for s in samples}.values())
+        logger.info(f"Matched {len(unique_samples)} HME100K samples.")
+        return unique_samples
+
+    # Make sure to REMOVE any other older versions of `parse_hme100k` located further down the file.
+
 
 
 

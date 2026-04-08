@@ -176,6 +176,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=None, help='Learning rate')
     parser.add_argument('--skip-validation', action='store_true', help='Skip dataset validation')
     parser.add_argument('--force', action='store_true', help='Force training even if validation has warnings')
+    parser.add_argument('--force-hf-push', action='store_true', help='Force overwrite of existing HF datasets')
     return parser.parse_args()
 
 
@@ -201,6 +202,7 @@ def main():
     if args.batch_size: config.batch_size = args.batch_size
     if args.num_epochs: config.num_epochs = args.num_epochs
     if args.lr: config.lr = args.lr
+    if args.force_hf_push: config.force_hf_push = True
     
     logger = setup_logger("TAMER", config.log_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

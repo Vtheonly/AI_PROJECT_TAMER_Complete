@@ -542,6 +542,7 @@ class DatasetValidator:
 
 
    
+# ... (around line 431)
     def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
         try:
             from datasets import load_dataset
@@ -562,15 +563,26 @@ class DatasetValidator:
                     latex = item.get('latex')
                     if img is None or not latex: continue
 
+                    # Handle case where HF yields a dict with bytes instead of a PIL Image
+                    if isinstance(img, dict) and 'bytes' in img:
+                        import io
+                        from PIL import Image
+                        try:
+                            img = Image.open(io.BytesIO(img['bytes']))
+                        except Exception:
+                            continue
+
+                    if not hasattr(img, 'save'):
+                        continue
+
                     h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                     img_path = img_dir / f"img_{idx}_{h}.png"
                     
                     if not img_path.exists():
-                        # --- THE FIX: Wrap the save in a try/except ---
                         try:
                             img.save(img_path)
                         except Exception:
-                            # Skip corrupt images on the HF Hub (like index 130,000)
+                            # Skip corrupt images on the HF Hub 
                             continue
                     
                     valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
@@ -585,14 +597,12 @@ class DatasetValidator:
                 json.dump(valid_samples, f, ensure_ascii=False, indent=2)
                 
             logger.info(f"Successfully pulled verified dataset '{dataset_name}'")
-            return True # Logic: If we pulled data, we are ready.
+            return True 
             
         except Exception as e:
             logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
             return False
-   
-   
-   
+
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
         token = getattr(self.config, 'hf_token', None) or os.getenv("HF_TOKEN")
         if not token:
@@ -614,7 +624,6 @@ class DatasetValidator:
             try:
                 username = api.whoami()["name"]
             except Exception:
-                # Token invalid / network issue: don't crash training or preparation.
                 logger.warning("Hugging Face auth check failed. Skipping push of verified dataset.")
                 return
 
@@ -623,13 +632,15 @@ class DatasetValidator:
                 base_repo = f"{username}/{base_repo}"
 
             repo_id = f"{base_repo}-{dataset_name}"
-            
             logger.info(f"Checking Hugging Face repository: {repo_id}")
             
             try:
                 api.repo_info(repo_id, repo_type="dataset")
-                logger.info(f"Repo {repo_id} already exists. Skipping push to avoid overwriting.")
-                return 
+                if getattr(self.config, 'force_hf_push', False):
+                    logger.info(f"Repo {repo_id} exists. --force-hf-push is enabled, overwriting...")
+                else:
+                    logger.info(f"Repo {repo_id} already exists. Skipping push to avoid overwriting. Run with --force-hf-push to override.")
+                    return 
             except Exception:
                 pass
                 
