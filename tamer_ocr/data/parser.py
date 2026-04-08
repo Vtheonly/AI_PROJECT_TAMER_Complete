@@ -252,44 +252,58 @@ class DatasetParser:
 
 
 
+
+
+
+
     def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
-            logger.info(f"Deep-Parsing CROHME from {extract_dir}")
+            logger.info(f"Power-Parsing CROHME from {extract_dir}")
             samples = []
             image_map = {}
+            # 1. Find EVERY image in the 1.7GB folder tree
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith(self.IMG_EXTENSIONS):
-                        image_map[os.path.splitext(f)[0]] = os.path.join(root, f)
+                        image_map[os.path.splitext(f)[0].lower()] = os.path.join(root, f)
 
+            # 2. Find EVERY .txt file and match against images
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith('.txt') and 'readme' not in f.lower():
                         try:
                             with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as tf:
                                 for line in tf:
-                                    parts = line.strip().split('\t')
-                                    if len(parts) >= 2:
-                                        img_id = os.path.splitext(parts[0].strip())[0]
-                                        if img_id in image_map:
-                                            samples.append({"image": image_map[img_id], "latex": parts[1].strip()})
+                                    line = line.strip()
+                                    if not line: continue
+                                    # Split by Tab or Space
+                                    parts = line.split('\t') if '\t' in line else line.split(' ', 1)
+                                    if len(parts) < 2: continue
+                                    
+                                    img_id = os.path.splitext(parts[0].strip())[0].lower()
+                                    latex = parts[1].strip()
+                                    if img_id in image_map:
+                                        samples.append({"image": image_map[img_id], "latex": latex})
                         except: continue
+            logger.info(f"Matched {len(samples)} CROHME samples.")
             return samples
 
     def parse_hme100k(self, extract_dir: str) -> List[Dict[str, Any]]:
-        logger.info(f"Deep-Parsing HME100K from {extract_dir}")
+        logger.info(f"Power-Parsing HME100K from {extract_dir}")
         samples = []
-        image_map = {os.path.splitext(f)[0]: os.path.join(r, f) 
+        image_map = {os.path.splitext(f)[0].lower(): os.path.join(r, f) 
                      for r, _, fs in os.walk(extract_dir) for f in fs if f.lower().endswith(self.IMG_EXTENSIONS)}
         
-        # Check standard HME100K label file names
-        for label_file in ['labels.txt', 'train_labels.txt', 'test_labels.txt']:
-            for root, _, files in os.walk(extract_dir):
-                if label_file in files:
-                    with open(os.path.join(root, label_file), 'r', encoding='utf-8') as f:
-                        for line in f:
+        # Check for any .txt file in the HME100K folder
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith('.txt'):
+                    with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as label_f:
+                        for line in label_f:
                             parts = line.strip().split(' ', 1)
-                            if len(parts) == 2 and parts[0] in image_map:
-                                samples.append({"image": image_map[parts[0]], "latex": parts[1]})
+                            if len(parts) == 2:
+                                img_id = os.path.splitext(parts[0])[0].lower()
+                                if img_id in image_map:
+                                    samples.append({"image": image_map[img_id], "latex": parts[1]})
         return samples
 
 

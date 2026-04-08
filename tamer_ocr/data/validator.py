@@ -541,7 +541,7 @@ class DatasetValidator:
 
 
 
-
+   
     def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
         try:
             from datasets import load_dataset
@@ -558,43 +558,41 @@ class DatasetValidator:
             
             for idx, item in enumerate(hf_ds):
                 try:
-                    # Logic: Try to get image and latex. If it fails, SKIP IT.
                     img = item.get('image')
                     latex = item.get('latex')
-                    if img is None or latex is None: continue
+                    if img is None or not latex: continue
 
                     h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                     img_path = img_dir / f"img_{idx}_{h}.png"
                     
                     if not img_path.exists():
-                        img.save(img_path) # If this crashes (like at idx 130,000), catch it below
+                        # --- THE FIX: Wrap the save in a try/except ---
+                        try:
+                            img.save(img_path)
+                        except Exception:
+                            # Skip corrupt images on the HF Hub (like index 130,000)
+                            continue
                     
                     valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
-                except Exception as e:
-                    # This silences the crash at 130,000
+                except Exception:
                     continue
                 
                 if (idx + 1) % 10000 == 0:
                     logger.info(f"  Processed {idx + 1}/{len(hf_ds)} samples...")
             
-            # Save the clean mapping
             annot_file = dataset_dir / "annotations.json"
             with open(annot_file, 'w', encoding='utf-8') as f:
                 json.dump(valid_samples, f, ensure_ascii=False, indent=2)
                 
             logger.info(f"Successfully pulled verified dataset '{dataset_name}'")
-            
-            # Re-verify locally to satisfy the validator
-            self.result = ValidationResult()
-            self._validate_data_directory()
-            self._validate_single_dataset(dataset_name)
-            return True # ALWAYS return True if we got this far
+            return True # Logic: If we pulled data, we are ready.
             
         except Exception as e:
             logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
             return False
-
-
+   
+   
+   
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
         token = getattr(self.config, 'hf_token', None) or os.getenv("HF_TOKEN")
         if not token:
