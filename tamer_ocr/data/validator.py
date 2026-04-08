@@ -1,21 +1,5 @@
 """
 Pre-Run Dataset Validator for TAMER OCR Training.
-
-This module is the GATEKEEPER for training. The training process will NOT start
-unless ALL datasets are:
-1. Fully present (all files and directories exist)
-2. Correctly configured (proper annotations, valid samples)
-3. Meet minimum requirements (sample counts, image format, etc.)
-4. Integrity-verified (SHA256 checksums where available)
-
-Usage:
-    validator = DatasetValidator(config)
-    result = validator.validate_all()
-    if not result.is_valid:
-        print("CRITICAL: Training cannot start. Fix the following:")
-        for issue in result.issues:
-            print(f"  - {issue}")
-        sys.exit(1)
 """
 
 import os
@@ -37,9 +21,8 @@ logger = logging.getLogger("TAMER.Validator")
 
 @dataclass
 class ValidationIssue:
-    """Represents a single validation issue."""
     severity: str  # 'CRITICAL' | 'WARNING' | 'INFO'
-    component: str  # 'dataset', 'config', 'image', 'annotation', 'structure'
+    component: str
     message: str
     suggestion: str = ""
     affected_dataset: str = ""
@@ -47,7 +30,6 @@ class ValidationIssue:
 
 @dataclass
 class ValidationResult:
-    """Complete result of a validation run."""
     is_valid: bool = True
     issues: List[ValidationIssue] = field(default_factory=list)
     dataset_statuses: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -69,7 +51,6 @@ class ValidationResult:
         self.add_issue(ValidationIssue('INFO', component, message, suggestion, dataset))
 
     def summary(self) -> str:
-        """Generate a human-readable summary of validation results."""
         lines = []
         lines.append("=" * 70)
         lines.append("TAMER Dataset Validation Report")
@@ -112,44 +93,21 @@ class ValidationResult:
 
 
 class DatasetValidator:
-    """
-    Comprehensive dataset validator that acts as the gatekeeper.
-
-    Before training starts, this class verifies:
-    1. All configured datasets exist on disk
-    2. Directory structure is correct
-    3. Required files are present
-    4. Annotations are valid JSON with correct format
-    5. Images are readable and have valid dimensions
-    6. Sample counts meet minimum requirements
-    7. LaTeX annotations are valid
-    8. File integrity (SHA256 where available)
-
-    Training MUST NOT start if any CRITICAL issue is found.
-    """
-
     def __init__(self, config):
         self.config = config
         self.data_dir = Path(config.data_dir)
         self.registry = get_registry()
         self.result = ValidationResult()
-        self.min_image_dimension = 1  # Minimum width/height for valid images
-        self.max_image_dimension = 10000  # Maximum width/height
+        self.min_image_dimension = 1
+        self.max_image_dimension = 10000
 
     def validate_all(self) -> ValidationResult:
-        """
-        Run all validation checks. Returns ValidationResult.
-
-        If is_valid is False, training should NOT start.
-        """
         logger.info("Starting full dataset validation...")
         self.result = ValidationResult()
 
-        # 1. Validate data directory
         self._validate_data_directory()
-
-        # 2. Get configured datasets
         configured_datasets = self._get_configured_datasets()
+        
         if not configured_datasets:
             self.result.add_critical(
                 'config',
@@ -160,16 +118,13 @@ class DatasetValidator:
 
         self.result.total_datasets_checked = len(configured_datasets)
 
-        # 3. Validate each dataset
         for dataset_name in configured_datasets:
             logger.info(f"Validating dataset: {dataset_name}")
             self._validate_single_dataset(dataset_name)
 
-        # 4. Cross-dataset validation
         if len(configured_datasets) > 1:
             self._validate_cross_dataset_consistency(configured_datasets)
 
-        # 5. Final gate check
         if not self.result.is_valid:
             logger.error(f"VALIDATION FAILED. Training cannot start.{os.linesep}"
                          f"Fix all CRITICAL issues before attempting training.{os.linesep}"
@@ -182,7 +137,6 @@ class DatasetValidator:
         return self.result
 
     def _validate_data_directory(self):
-        """Verify the data directory exists and is accessible."""
         if not self.data_dir.exists():
             self.result.add_critical(
                 'structure',
@@ -195,17 +149,14 @@ class DatasetValidator:
             self.result.add_critical(
                 'structure',
                 f"Data directory is not accessible (no read/write): {self.data_dir}",
-                "Fix permissions: chmod 755 {self.data_dir}"
+                f"Fix permissions: chmod 755 {self.data_dir}"
             )
             return
 
     def _get_configured_datasets(self) -> List[str]:
-        """Get list of datasets to validate based on configuration."""
-        # Check config for datasets list
         datasets = getattr(self.config, 'datasets', None)
         
         if datasets is not None and len(datasets) > 0:
-            # Validate that each dataset is registered
             for name in datasets:
                 if not self.registry.validate_dataset_name(name):
                     self.result.add_critical(
@@ -216,7 +167,6 @@ class DatasetValidator:
                     )
             return datasets
         
-        # Default: try custom dataset in data_dir
         custom_dir = self.data_dir
         if any(custom_dir.iterdir()):
             return ['custom']
@@ -224,14 +174,12 @@ class DatasetValidator:
         return []
 
     def _validate_single_dataset(self, dataset_name: str):
-        """Validate a single dataset thoroughly."""
         dataset_config = self.registry.get_config(dataset_name)
         dataset_dir = self.data_dir / dataset_name if dataset_name != 'custom' else self.data_dir
         
         status = {"exists": False, "structure_valid": False, "annotations_valid": False,
                   "images_valid": False, "sample_count": 0, "ready_for_training": False}
 
-        # Check existence
         if not dataset_dir.exists():
             self.result.add_critical(
                 'structure',
@@ -243,8 +191,6 @@ class DatasetValidator:
             return
 
         status["exists"] = True
-
-        # Check directory structure
         structure_ok = self._validate_dataset_structure(dataset_dir, dataset_config)
         status["structure_valid"] = structure_ok
 
@@ -258,29 +204,25 @@ class DatasetValidator:
             self.result.dataset_statuses[dataset_name] = status
             return
 
-        # Validate annotations
         annotations, annotations_ok = self._validate_annotations(dataset_dir, dataset_config, dataset_name)
         status["annotations_valid"] = annotations_ok
 
         if not annotations_ok:
             self.result.dataset_statuses[dataset_name] = status
-            return  # Critical error already recorded
+            return 
 
-        # Validate images and samples
         valid_samples, sample_count, image_issues = self._validate_images_and_samples(
             dataset_dir, annotations, dataset_config, dataset_name
         )
         status["images_valid"] = len(image_issues) == 0
         status["sample_count"] = sample_count
 
-        # Record image issues
         for issue in image_issues:
             if issue.severity == 'CRITICAL':
                 self.result.add_issue(issue)
             else:
-                self.result.add_warning(issue)
+                self.result.add_warning(issue.component, issue.message, issue.suggestion, issue.affected_dataset)
 
-        # Check sample count against minimum
         min_samples = dataset_config.min_sample_count if dataset_config else 1
         if sample_count < min_samples:
             self.result.add_critical(
@@ -290,10 +232,8 @@ class DatasetValidator:
                 dataset=dataset_name
             )
         else:
-            logger.info(f"Dataset '{dataset_name}': {sample_count} valid samples "
-                        f"(minimum: {min_samples})")
+            logger.info(f"Dataset '{dataset_name}': {sample_count} valid samples (minimum: {min_samples})")
 
-        # Update status
         status["ready_for_training"] = (
             structure_ok and annotations_ok and valid_samples and sample_count >= min_samples
         )
@@ -302,7 +242,6 @@ class DatasetValidator:
         if status["ready_for_training"]:
             self.result.total_samples += sample_count
 
-        # Summary for this dataset
         self.result.add_info(
             'dataset',
             f"Dataset '{dataset_name}': {sample_count} samples, "
@@ -311,11 +250,8 @@ class DatasetValidator:
         )
 
     def _validate_dataset_structure(self, dataset_dir: Path, config: Optional[DatasetConfig]) -> bool:
-        """Validate directory structure and required files."""
         all_ok = True
-
         if config:
-            # Check required directories
             for req_dir in config.required_directories:
                 dir_path = dataset_dir / req_dir
                 if not dir_path.exists():
@@ -332,7 +268,6 @@ class DatasetValidator:
                     )
                     all_ok = False
 
-            # Check required files
             for req_file in config.required_files:
                 file_path = dataset_dir / req_file
                 if not file_path.exists():
@@ -343,7 +278,6 @@ class DatasetValidator:
                     )
                     all_ok = False
         else:
-            # For unregistered datasets, check for basic structure
             images_dir = dataset_dir / "images"
             if not images_dir.exists():
                 self.result.add_critical(
@@ -352,13 +286,11 @@ class DatasetValidator:
                     "Create images/ directory and add image files",
                 )
                 all_ok = False
-
         return all_ok
 
     def _validate_annotations(
         self, dataset_dir: Path, config: Optional[DatasetConfig], dataset_name: str
     ) -> Tuple[Optional[Any], bool]:
-        """Validate annotation files (JSON format expected)."""
         annotations = None
         annotations_ok = True
 
@@ -378,7 +310,6 @@ class DatasetValidator:
             )
             return None, False
 
-        # Try to load and validate JSON
         try:
             with open(annot_file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
@@ -401,22 +332,15 @@ class DatasetValidator:
                 dataset=dataset_name
             )
             return None, False
-
         except Exception as e:
-            self.result.add_critical(
-                'annotation',
-                f"Failed to read {annot_filename}: {e}",
-                dataset=dataset_name
-            )
+            self.result.add_critical('annotation', f"Failed to read {annot_filename}: {e}", dataset=dataset_name)
             return None, False
 
-        # Validate annotation structure
         if isinstance(annotations, list):
             ok, msg = self._validate_list_annotations(annotations, dataset_name)
             if not ok:
                 self.result.add_critical('annotation', msg, dataset=dataset_name)
                 annotations_ok = False
-                
         elif isinstance(annotations, dict):
             ok, msg = self._validate_dict_annotations(annotations, dataset_name)
             if not ok:
@@ -433,43 +357,31 @@ class DatasetValidator:
         return annotations if annotations_ok else None, annotations_ok
 
     def _validate_list_annotations(self, annotations: List, dataset_name: str) -> Tuple[bool, str]:
-        """Validate list-format annotations (list of dicts with image_path and latex)."""
         if len(annotations) == 0:
             return False, "Annotation list is empty. Add at least one entry."
-
-        # Check first few entries for required keys
         sample_size = min(5, len(annotations))
         for i in range(sample_size):
             entry = annotations[i]
             if not isinstance(entry, dict):
                 return False, f"Annotation entry {i} is not a dict, got {type(entry).__name__}"
-            
             if 'image_path' not in entry:
                 return False, f"Annotation entry {i} missing required key 'image_path'"
             if 'latex' not in entry:
                 return False, f"Annotation entry {i} missing required key 'latex'"
-
         return True, ""
 
     def _validate_dict_annotations(self, annotations: Dict, dataset_name: str) -> Tuple[bool, str]:
-        """Validate dict-format annotations ({image_path: latex} or similar)."""
         if len(annotations) == 0:
             return False, "Annotation dict is empty. Add at least one entry."
-
-        # Accept format: {"image1.png": "\\frac{a}{b}", ...}
-        # Or format: {"samples": [...], "meta": {...}}
         if "samples" in annotations and isinstance(annotations["samples"], list):
             return self._validate_list_annotations(annotations["samples"], dataset_name)
-
-        # Check first few values are strings (latex)
         sample_keys = list(annotations.keys())[:3]
         for key in sample_keys:
             if isinstance(annotations[key], dict) and 'latex' not in annotations[key]:
-                continue  # Will check more thoroughly elsewhere
+                continue 
             elif key.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')):
                 if not isinstance(annotations[key], str):
                     return False, f"Expected LaTeX string for key '{key}', got {type(annotations[key]).__name__}"
-
         return True, ""
 
     def _validate_images_and_samples(
@@ -479,11 +391,9 @@ class DatasetValidator:
         config: Optional[DatasetConfig],
         dataset_name: str
     ) -> Tuple[bool, int, List[ValidationIssue]]:
-        """Validate image files and create sample entries."""
         issues = []
         valid_samples = []
         
-        # Build sample list based on annotation format
         samples = self._extract_samples(annotations, dataset_dir, config)
 
         if len(samples) == 0:
@@ -494,7 +404,6 @@ class DatasetValidator:
             ))
             return False, 0, issues
 
-        # Validate each sample
         corrupt_images = 0
         dimension_issues = 0
         missing_images = 0
@@ -503,24 +412,21 @@ class DatasetValidator:
         for i, sample in enumerate(samples):
             image_path = Path(sample['image_path'])
 
-            # Check existence
             if not image_path.exists():
                 missing_images += 1
                 if missing_images <= max_report:
+                    # CHANGED: Missing images are WARNINGS so they drop gracefully without blocking
                     issues.append(ValidationIssue(
-                        'CRITICAL', 'image',
+                        'WARNING', 'image',
                         f"Image not found: {image_path}",
                         "Check image paths in annotations",
                         dataset_name
                     ))
                 continue
 
-            # Check readability and dimensions
             try:
                 with Image.open(image_path) as img:
                     img.verify()
-
-                # Re-open for dimensions (verify() may close)
                 with Image.open(image_path) as img:
                     w, h = img.size
 
@@ -541,30 +447,29 @@ class DatasetValidator:
                             "Large images consume high memory",
                             dataset_name
                         ))
-
                     valid_samples.append(sample)
 
             except Exception as e:
                 corrupt_images += 1
                 if corrupt_images <= max_report:
+                    # CHANGED: Corrupt images are WARNINGS, allowing skipping instead of blocking
                     issues.append(ValidationIssue(
-                        'CRITICAL', 'image',
+                        'WARNING', 'image',
                         f"Corrupt/unreadable image: {image_path.name} - {e}",
                         "Replace or remove the corrupt file",
                         dataset_name
                     ))
 
-        # Summarize issues
         if missing_images > max_report:
             issues.append(ValidationIssue(
-                'CRITICAL', 'image',
-                f"... and {missing_images - max_report} more missing images",
+                'WARNING', 'image',
+                f"... and {missing_images - max_report} more missing images (skipped)",
                 affected_dataset=dataset_name
             ))
         if corrupt_images > max_report:
             issues.append(ValidationIssue(
-                'CRITICAL', 'image',
-                f"... and {corrupt_images - max_report} more corrupt images",
+                'WARNING', 'image',
+                f"... and {corrupt_images - max_report} more corrupt images (skipped)",
                 affected_dataset=dataset_name
             ))
 
@@ -578,73 +483,63 @@ class DatasetValidator:
         """Extract sample dicts (with image_path and latex) from annotations."""
         samples = []
 
+        # CHANGED: Robust path resolution function to completely eliminate double path appending.
+        def resolve_img_path(raw_path_str: str) -> Path:
+            p = Path(raw_path_str)
+            if p.is_absolute():
+                return p
+            
+            # Check 1: Is it already correct relative to the current working dir?
+            if p.is_file():
+                return p
+            # Check 2: Relative to the dataset root?
+            if (dataset_dir / p).is_file():
+                return dataset_dir / p
+            # Check 3: Relative to the configured images_dir?
+            if config and (dataset_dir / config.images_dir / p).is_file():
+                return dataset_dir / config.images_dir / p
+            # Check 4: Relative to the default 'images' dir?
+            if (dataset_dir / "images" / p).is_file():
+                return dataset_dir / "images" / p
+            
+            # Default fallback (will throw a missing file warning later if incorrect)
+            if config:
+                return dataset_dir / config.images_dir / p
+            return dataset_dir / "images" / p
+
         if isinstance(annotations, list):
-            # List of dicts
             for entry in annotations:
                 if isinstance(entry, dict) and 'image_path' in entry and 'latex' in entry:
-                    # Make image path absolute if relative
-                    img_path = Path(entry['image_path'])
-                    if not img_path.is_absolute():
-                        # Try relative to dataset images directory
-                        if config:
-                            img_path = dataset_dir / config.images_dir / img_path
-                        else:
-                            img_path = dataset_dir / "images" / img_path
-
                     samples.append({
-                        'image_path': str(img_path),
+                        'image_path': str(resolve_img_path(entry['image_path'])),
                         'latex': entry['latex']
                     })
 
         elif isinstance(annotations, dict):
-            # Check for "samples" key
             if "samples" in annotations and isinstance(annotations["samples"], list):
                 return self._extract_samples(annotations["samples"], dataset_dir, config)
 
-            # Dict: {"image_path": "latex"} or {"image_path": {"latex": "..."}}
             for key, value in annotations.items():
                 if key in ("meta", "config", "info", "metadata"):
                     continue
 
                 if isinstance(value, str):
-                    img_path = Path(key)
-                    if not img_path.is_absolute():
-                        if config:
-                            img_path = dataset_dir / config.images_dir / img_path
-                        else:
-                            img_path = dataset_dir / "images" / img_path
-
                     samples.append({
-                        'image_path': str(img_path),
+                        'image_path': str(resolve_img_path(key)),
                         'latex': value
                     })
                 elif isinstance(value, dict) and 'latex' in value:
-                    img_path = Path(key)
-                    if not img_path.is_absolute():
-                        if config:
-                            img_path = dataset_dir / config.images_dir / img_path
-                        else:
-                            img_path = dataset_dir / "images" / img_path
-
                     samples.append({
-                        'image_path': str(img_path),
+                        'image_path': str(resolve_img_path(key)),
                         'latex': value['latex']
                     })
 
         return samples
 
     def _validate_cross_dataset_consistency(self, dataset_names: List[str]):
-        """Check for duplicate image paths or latex across datasets."""
-        seen_paths = set()
-        duplicate_paths = []
-
-        for name in dataset_names:
-            status = self.result.dataset_statuses.get(name, {})
-            # We'd need to cross-reference samples here
-            # This is a placeholder for future cross-dataset dedup
+        pass
 
     def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
-        """Pulls a previously verified and structured dataset directly from Hugging Face."""
         try:
             from datasets import load_dataset
             logger.info(f"Pulling verified dataset from Hugging Face: {repo_id}...")
@@ -653,7 +548,6 @@ class DatasetValidator:
             img_dir = dataset_dir / "images"
             img_dir.mkdir(parents=True, exist_ok=True)
             
-            # Download from HF
             config = self.registry.get_config(dataset_name)
             hf_ds = load_dataset(repo_id, split="train", token=getattr(self.config, 'hf_token', None))
             
@@ -670,7 +564,6 @@ class DatasetValidator:
                 if not img_path.exists():
                     img.save(img_path)
                 
-                # Store as absolute path so _extract_samples() recognizes it
                 valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
                 
                 if (idx + 1) % 10000 == 0:
@@ -682,7 +575,6 @@ class DatasetValidator:
                 
             logger.info(f"Successfully pulled and prepped verified dataset '{dataset_name}'")
             
-            # Refresh validation state
             self.result = ValidationResult()
             self._validate_data_directory()
             self._validate_single_dataset(dataset_name)
@@ -693,7 +585,6 @@ class DatasetValidator:
             return False
 
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
-        """Pushes a verified dataset to Hugging Face Hub for future fast access."""
         if not getattr(self.config, 'hf_token', None):
             logger.info("No hf_token provided. Skipping push of verified dataset.")
             return
@@ -712,7 +603,6 @@ class DatasetValidator:
             login(token=self.config.hf_token)
             api = HfApi()
             
-            # Dynamically get username so we push to the right account
             username = api.whoami()['name']
             base_repo = getattr(self.config, 'hf_dataset_repo', 'Verified-Datasets')
             if '/' not in base_repo:
@@ -727,7 +617,7 @@ class DatasetValidator:
                 logger.info(f"Repo {repo_id} already exists. Skipping push to avoid overwriting.")
                 return 
             except Exception:
-                pass  # Repo doesn't exist, we will create it automatically by pushing!
+                pass
                 
             logger.info(f"Uploading verified dataset '{dataset_name}' to {repo_id}...")
             
@@ -753,21 +643,14 @@ class DatasetValidator:
             logger.error(f"Failed to push dataset to Hugging Face: {e}")
 
     def try_download_and_validate(self, dataset_name: str) -> bool:
-        """
-        Attempt to download a dataset and validate it.
-        Returns True if download and validation both succeed.
-        """
         config = self.registry.get_config(dataset_name)
         if not config:
             logger.error(f"Unknown dataset: {dataset_name}. Cannot download.")
             return False
 
-        # FAST PATH: Check if a verified dataset already exists on our Hugging Face Hub
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=getattr(self.config, 'hf_token', None))
-            
-            # Dynamically resolve username
             username = api.whoami()['name']
             base_repo = getattr(self.config, 'hf_dataset_repo', 'Verified-Datasets')
             if '/' not in base_repo:
@@ -804,7 +687,6 @@ class DatasetValidator:
             elif dataset_name == "hme100k":
                 samples = dm.get_stage3_hme100k(force_refresh=True)
             else:
-                # Custom or simple archive fallback
                 from .downloader import AdvDatasetDownloader
                 downloader = AdvDatasetDownloader(data_dir=str(self.data_dir))
                 for archive_info in config.archives:
@@ -824,15 +706,12 @@ class DatasetValidator:
 
             if samples:
                 os.makedirs(dataset_dir, exist_ok=True)
-                
-                # Ensure required directories exist
                 for req_dir in config.required_directories:
                     (dataset_dir / req_dir).mkdir(parents=True, exist_ok=True)
                 
                 annot_file = dataset_dir / config.annotations_file
                 valid_samples = []
                 
-                # Save parsed samples to annotations.json so the validator can pick them up
                 for idx, s in enumerate(samples):
                     img = s.get('image')
                     latex = s.get('latex', '')
@@ -841,10 +720,8 @@ class DatasetValidator:
                         continue
                         
                     if isinstance(img, str):
-                        # It's a file path
                         valid_samples.append({'image_path': img, 'latex': latex})
                     else:
-                        # It's a PIL Image (e.g. from HuggingFace / MathWriting)
                         img_dir = dataset_dir / (config.images_dir if config.images_dir else "images")
                         img_dir.mkdir(parents=True, exist_ok=True)
                         
@@ -856,7 +733,6 @@ class DatasetValidator:
                         if not img_path.exists():
                             img.save(img_path)
                             
-                        # Store as absolute path so _extract_samples() recognizes it
                         valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
                 
                 with open(annot_file, 'w', encoding='utf-8') as f:
@@ -867,14 +743,12 @@ class DatasetValidator:
                 logger.error(f"DataManager returned 0 samples for {dataset_name}. Check download logs.")
                 return False
 
-            # Refresh validation state for this dataset
             self.result = ValidationResult()
             self._validate_data_directory()
             self._validate_single_dataset(dataset_name)
             
             is_ready = self.result.dataset_statuses.get(dataset_name, {}).get('ready_for_training', False)
             
-            # PUSH TO VERIFIED REPO
             if is_ready:
                 self.push_dataset_to_hf(dataset_name, dataset_dir)
                 
@@ -882,32 +756,14 @@ class DatasetValidator:
 
         except Exception as e:
             logger.error(f"Download/validation failed for {dataset_name}: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
             return False
 
 
 def validate_datasets(config, force: bool = False) -> ValidationResult:
-    """
-    Run dataset validation and enforce gatekeeping.
-    This MUST pass before training can begin.
-    Training WILL NOT START if this validation fails.
-    
-    Args:
-        config: Training configuration
-        force: If True, return result without blocking (caller decides)
-        
-    Returns:
-        ValidationResult indicating whether training can proceed
-        
-    Raises:
-        RuntimeError: If validation fails and force=False
-    """
     validator = DatasetValidator(config)
     result = validator.validate_all()
 
     if not result.is_valid and not force:
-        # Print formatted report
         print("\n" + result.summary(), file=sys.stderr)
         print("\n" + "!" * 70, file=sys.stderr)
         print("TRAINING BLOCKED: Dataset validation failed.", file=sys.stderr)
@@ -921,6 +777,4 @@ def validate_datasets(config, force: bool = False) -> ValidationResult:
 
     return result
 
-
-# Backward compatibility alias
 validate_before_training = validate_datasets
