@@ -249,58 +249,40 @@ class DatasetParser:
 
 
 
-
     def parse_crohme(self, extract_dir: str) -> List[Dict[str, Any]]:
-            logger.info(f"Ultra-Parsing CROHME from {extract_dir}")
+            logger.info(f"Deep-Parsing CROHME from {extract_dir}")
             samples = []
-            
-            # 1. Map every image in the 1.7GB folder by its base name
             image_map = {}
+            # 1. Catalog every image in the 1.7GB folder
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith(self.IMG_EXTENSIONS):
                         image_map[os.path.splitext(f)[0]] = os.path.join(root, f)
 
-            # 2. Find every .txt file and try multiple delimiters
+            # 2. Match them against any .txt files found
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith('.txt') and 'readme' not in f.lower():
                         try:
                             with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as tf:
                                 for line in tf:
-                                    # Try Tab, then Space, then pipe
-                                    line = line.strip()
-                                    if not line: continue
-                                    
-                                    parts = line.split('\t') if '\t' in line else line.split(' ', 1)
-                                    if len(parts) < 2: continue
-                                    
-                                    img_id = os.path.splitext(parts[0].strip())[0]
-                                    latex = parts[1].strip()
-                                    
-                                    if img_id in image_map:
-                                        samples.append({"image": image_map[img_id], "latex": latex})
+                                    parts = line.strip().split('\t')
+                                    if len(parts) >= 2:
+                                        img_id = os.path.splitext(parts[0].strip())[0]
+                                        if img_id in image_map:
+                                            samples.append({"image": image_map[img_id], "latex": parts[1].strip()})
                         except: continue
-
-            # 3. Final Check: if still 0, check for .inkml-style directories
-            if not samples:
-                samples.extend(self._parse_annotations_json(extract_dir))
-
-            logger.info(f"CROHME Result: {len(samples)} valid samples.")
             return samples
 
     def parse_hme100k(self, extract_dir: str) -> List[Dict[str, Any]]:
-        # HME100K usually has a 'labels.txt' in the root or 'train_labels.txt'
-        logger.info(f"Parsing HME100K from {extract_dir}")
+        logger.info(f"Deep-Parsing HME100K from {extract_dir}")
         samples = []
         image_map = {os.path.splitext(f)[0]: os.path.join(r, f) 
-                     for r, _, fs in os.walk(extract_dir) 
-                     for f in fs if f.lower().endswith(self.IMG_EXTENSIONS)}
+                     for r, _, fs in os.walk(extract_dir) for f in fs if f.lower().endswith(self.IMG_EXTENSIONS)}
         
-        # Look for common label files
         for label_file in ['labels.txt', 'train_labels.txt', 'test_labels.txt']:
-            path = os.path.join(extract_dir, label_file)
-            if os.path.exists(path):
+            path = self._find_label_file(extract_dir, [label_file])
+            if path:
                 with open(path, 'r', encoding='utf-8') as f:
                     for line in f:
                         parts = line.strip().split(' ', 1)

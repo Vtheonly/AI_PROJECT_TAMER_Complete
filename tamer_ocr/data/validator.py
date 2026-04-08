@@ -540,6 +540,7 @@ class DatasetValidator:
         pass
 
 
+
     def pull_verified_dataset(self, dataset_name: str, repo_id: str) -> bool:
             try:
                 from datasets import load_dataset
@@ -549,7 +550,6 @@ class DatasetValidator:
                 img_dir = dataset_dir / "images"
                 img_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Load dataset from HF
                 hf_ds = load_dataset(repo_id, split="train", token=getattr(self.config, 'hf_token', None))
                 
                 valid_samples = []
@@ -557,40 +557,32 @@ class DatasetValidator:
                 
                 for idx, item in enumerate(hf_ds):
                     try:
-                        img = item.get('image')
-                        latex = item.get('latex', '')
+                        img = item['image']
+                        latex = item['latex']
                         
-                        if img is None or not latex:
-                            continue
-
-                        # Generate path
                         h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                         img_path = img_dir / f"img_{idx}_{h}.png"
                         
-                        # Safety check: Ensure the object is actually an image
                         if not img_path.exists():
-                            # This is where the crash happens; we wrap it in a try-except
+                            # This is where the crash happens. Wrapping it skips the bad file.
                             img.save(img_path)
                         
                         valid_samples.append({'image_path': str(img_path.resolve()), 'latex': latex})
-                        
                     except Exception as e:
-                        # LOG AND SKIP instead of crashing
-                        if idx % 1000 == 0:
-                            logger.warning(f"Skipping sample {idx} in {dataset_name} (corrupt on HF Hub): {e}")
+                        # Skip the bad image (like the one at index 130,000) and keep going
+                        if idx % 100 == 0 or idx == 130000:
+                            logger.warning(f"Skipping corrupt image at index {idx}: {e}")
                         continue
                     
                     if (idx + 1) % 10000 == 0:
-                        logger.info(f"  Processed {idx + 1}/{len(hf_ds)} images...")
+                        logger.info(f"  Saved {idx + 1}/{len(hf_ds)} images...")
                 
-                # Save clean annotations.json
                 annot_file = dataset_dir / "annotations.json"
                 with open(annot_file, 'w', encoding='utf-8') as f:
                     json.dump(valid_samples, f, ensure_ascii=False, indent=2)
                     
-                logger.info(f"Successfully pulled and prepped verified dataset '{dataset_name}'")
+                logger.info(f"Successfully pulled verified dataset '{dataset_name}' (skipped corrupt files)")
                 
-                # Final verification of what we just downloaded
                 self.result = ValidationResult()
                 self._validate_data_directory()
                 self._validate_single_dataset(dataset_name)
@@ -599,6 +591,8 @@ class DatasetValidator:
             except Exception as e:
                 logger.error(f"Failed to pull verified dataset {repo_id}: {e}")
                 return False
+
+
 
     def push_dataset_to_hf(self, dataset_name: str, dataset_dir: Path):
         token = getattr(self.config, 'hf_token', None) or os.getenv("HF_TOKEN")
