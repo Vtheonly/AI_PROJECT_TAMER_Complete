@@ -206,62 +206,55 @@ class AdvDownloader:
 # -----------------------------------------------------------------
     # Kaggle Download
     # -----------------------------------------------------------------
+
+
+# -----------------------------------------------------------------
+    # Kaggle Download (Hardcoded Username + Interactive Key Prompt)
+    # -----------------------------------------------------------------
     def download_kaggle(self, dataset_identifier: str, extract_dir: str):
         if self._is_extracted(extract_dir, required_min_files=10):
             logger.info(f"Kaggle dataset already extracted at {extract_dir}")
             return
             
-        # --- NEW AUTO-KAGGLE LOGIN FIX ---
-        # Automatically look for kaggle.json in the data/ folder!
-        kaggle_json_path = Path(getattr(self.config, 'data_dir', './data')) / 'kaggle.json'
+        # Hardcode your username
+        os.environ['KAGGLE_USERNAME'] = "merselfares"
         
-        if kaggle_json_path.exists():
-            import json
-            try:
-                with open(kaggle_json_path, 'r') as f:
-                    creds = json.load(f)
-                    os.environ['KAGGLE_USERNAME'] = creds.get('username', '')
-                    os.environ['KAGGLE_KEY'] = creds.get('key', '')
-                logger.info("Successfully loaded Kaggle credentials directly from data/kaggle.json!")
-            except Exception as e:
-                logger.error(f"Found kaggle.json but failed to parse it: {e}")
-
-        # Check if the environment variables are now set
-        kaggle_username = os.getenv('KAGGLE_USERNAME', '')
-        kaggle_key = os.getenv('KAGGLE_KEY', '')
+        # Check if the key is already set in the environment
+        kaggle_key = os.environ.get('KAGGLE_KEY', '')
         
-        if not (kaggle_username and kaggle_key):
-            error_msg = (
-                "Missing Kaggle Credentials!\n"
-                "1. Go to Kaggle.com -> Settings -> 'Create New Token'\n"
-                "2. Download the 'kaggle.json' file.\n"
-                f"3. Drag and drop it directly into this folder: {kaggle_json_path.parent}/\n"
-                "4. Run the script again!"
-            )
+        # If not set, prompt the user for it when the script reaches this point
+        if not kaggle_key:
+            import getpass
+            print("\n" + "="*50)
+            print("🔑 KAGGLE AUTHENTICATION REQUIRED")
+            print("Username is hardcoded to: merselfares")
+            kaggle_key = getpass.getpass("Enter your Kaggle API Key/Token: ").strip()
+            os.environ['KAGGLE_KEY'] = kaggle_key
+            print("="*50 + "\n")
+            
+        if not kaggle_key:
+            error_msg = "Kaggle key cannot be empty!"
             logger.error(error_msg)
             raise ValueError(error_msg)
         
-        logger.info(f"Downloading Kaggle dataset: {dataset_identifier}")
+        logger.info(f"Downloading Kaggle dataset: {dataset_identifier} using CLI...")
         
         try:
-            import kaggle
-            kaggle.api.authenticate()
-            
+            import subprocess
             os.makedirs(extract_dir, exist_ok=True)
-            kaggle.api.dataset_download_files(
-                dataset_identifier, 
-                path=extract_dir, 
-                unzip=True, 
-                quiet=False
+            
+            # Subprocess calls the CLI, which is much more stable than Python wrappers
+            result = subprocess.run(
+                ["kaggle", "datasets", "download", "-d", dataset_identifier, "-p", extract_dir, "--unzip"],
+                capture_output=True, text=True, check=True
             )
             logger.info(f"Kaggle dataset downloaded and extracted to {extract_dir}")
             
-        except ImportError:
-            logger.error("Kaggle API library not installed. Run: pip install kaggle")
-            raise DownloadError("Kaggle package not installed. Run: pip install kaggle>=1.5.16")
-        except Exception as e:
-            logger.error(f"Kaggle download failed: {e}")
-            raise DownloadError(f"Kaggle download failed: {e}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Kaggle CLI download failed. StdErr: {e.stderr}")
+            raise DownloadError(f"Kaggle download failed: {e.stderr}")
+    
+    
     # -----------------------------------------------------------------
     # Zenodo ZIP Download
     # -----------------------------------------------------------------

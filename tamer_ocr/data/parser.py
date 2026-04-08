@@ -552,39 +552,6 @@ class DatasetParser:
         return samples
 
 
-    def parse_hme100k(self, extract_dir: str) -> List[Dict[str, Any]]:
-        logger.info(f"Parsing HME100K from {extract_dir}")
-        samples = []
-
-        if not os.path.exists(extract_dir):
-            logger.error(f"HME100K directory not found: {extract_dir}")
-            return samples
-
-        samples = self._parse_hme100k_labels(extract_dir)
-        if samples:
-            logger.info(f"HME100K parsed (labels): {len(samples)} valid samples found.")
-            return samples
-
-        img_dirs = self._find_subdirectories(extract_dir, ['images', 'formula_images', 'train', 'data'])
-        formula_dirs = self._find_subdirectories(extract_dir, ['labels', 'annotations', 'formula'])
-        
-        if img_dirs:
-            img_dir = img_dirs[0]
-            images = self._find_images(img_dir)
-            
-            for img_path in images:
-                base = os.path.splitext(os.path.basename(img_path))[0]
-                latex = self._find_hme100k_label(base, extract_dir, formula_dirs)
-                if latex and self._validate_sample(img_path, latex):
-                    samples.append({"image": img_path, "latex": latex})
-
-        if not samples:
-            samples = self._parse_annotations_json(extract_dir)
-            logger.info(f"HME100K parsed (json): {len(samples)} valid samples found.")
-
-        logger.info(f"HME100K parsed: {len(samples)} valid samples found.")
-        return samples
-
     def _parse_hme100k_labels(self, root_dir: str) -> List[Dict[str, Any]]:
         samples = []
         label_file = self._find_label_file(root_dir)
