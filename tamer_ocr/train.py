@@ -24,7 +24,7 @@ from core.inference import constrained_beam_search
 from utils.metrics import calculate_metrics
 from utils.checkpoint import save_checkpoint, load_checkpoint, push_checkpoint_to_hf
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 import torch
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, config, device, logger, epoch):
@@ -83,7 +83,6 @@ def validate(model, loader, tokenizer, grammar, config, device, logger):
                 metrics_sum[k] += res[k]
             metrics_sum['total'] += 1
             
-        # Break early on validation just for tracing, remove if full val needed
         if metrics_sum['total'] > 100:
             break
             
@@ -94,13 +93,6 @@ def validate(model, loader, tokenizer, grammar, config, device, logger):
     return final_metrics
 
 def load_datasets(config, logger):
-    """
-    Load and prepare dataset samples from all configured datasets.
-    
-    Returns:
-        tuple: (all_samples, dataset_info) where all_samples is a list of sample dicts
-               and dataset_info contains per-dataset statistics
-    """
     from data.validator import DatasetValidator
     from data.datasets_registry import get_registry
     
@@ -108,7 +100,6 @@ def load_datasets(config, logger):
     dataset_info = {}
     validator = DatasetValidator(config)
     
-    # Determine which datasets to use
     datasets = config.datasets if config.datasets else ['custom']
     logger.info(f"Configured datasets: {datasets}")
     
@@ -118,8 +109,6 @@ def load_datasets(config, logger):
         
         logger.info(f"Loading dataset: {dataset_name}")
         
-        # Try to load annotations
-        annot_file = None
         if dataset_config:
             annot_file = dataset_dir / dataset_config.annotations_file
         else:
@@ -137,11 +126,9 @@ def load_datasets(config, logger):
             logger.error(f"Failed to load annotations for '{dataset_name}': {e}")
             continue
         
-        # Extract samples
         samples = validator._extract_samples(annotations, dataset_dir, dataset_config)
         logger.info(f"  Loaded {len(samples)} samples from '{dataset_name}'")
         
-        # Validate images
         valid_samples = []
         from pathlib import Path
         from PIL import Image
@@ -199,9 +186,8 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # List datasets if requested
     if args.list_datasets:
-        from data.datasets_registry import get_registry
+        from data.datasets_registry import get_registry, list_available_datasets
         available = list_available_datasets()
         print("\nAvailable Datasets:")
         print("-" * 40)
@@ -212,10 +198,8 @@ def main():
         print()
         return
     
-    # Initialize config
     config = Config()
     
-    # Apply command line overrides
     if args.datasets:
         config.datasets = args.datasets
     if args.download:
@@ -231,14 +215,10 @@ def main():
     if args.lr:
         config.lr = args.lr
     
-    # Setup logging
     logger = setup_logger("TAMER", config.log_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Initialized TAMER Pipeline on device: {device}")
     
-    # =========================================================================
-    # GATEKEEPER: Validate datasets before training
-    # =========================================================================
     if not config.skip_validation:
         logger.info("=" * 60)
         logger.info("PRE-TRAINING DATASET VALIDATION")
@@ -247,9 +227,7 @@ def main():
         if config.auto_download:
             logger.info("Auto-download mode enabled. Will download missing datasets.")
             try:
-                from data.datasets_registry import get_registry, list_available_datasets
                 from data.validator import DatasetValidator
-                
                 validator = DatasetValidator(config)
                 datasets = config.datasets if config.datasets else ['custom']
                 
@@ -274,30 +252,18 @@ def main():
             logger.error(f"Validation FAILED: {e}")
             logger.error("Fix all CRITICAL dataset issues before training.")
             logger.error("Run with --download to auto-download missing datasets.")
-            logger.error("Run with --list-datasets to see available options.")
             sys.exit(1)
     else:
         logger.warning("SKIP_VALIDATION is set. Training will proceed without dataset validation.")
-        logger.warning("This may cause runtime errors if datasets are misconfigured.")
     
-    # =========================================================================
-    # Load datasets
-    # =========================================================================
     all_samples, dataset_info = load_datasets(config, logger)
     
     if not all_samples:
         logger.error("No valid samples found! Cannot start training.")
-        logger.error("Ensure datasets are properly configured and downloaded.")
-        logger.error(f"  Available: {list_available_datasets()}")
         sys.exit(1)
     
     logger.info(f"Total training samples: {len(all_samples)}")
-    for name, info in dataset_info.items():
-        logger.info(f"  {name}: {info['valid']}/{info['total']} valid")
     
-    # =========================================================================
-    # Initialize tokenizer, model, and components
-    # =========================================================================
     tokenizer = LaTeXTokenizer()
     tokenizer.build_from_corpus([s['latex'] for s in all_samples])
     
@@ -330,8 +296,6 @@ def main():
     best_exprate = best_metrics.get('exact', 0.0)
     
     logger.info(f"Starting training from epoch {start_epoch}")
-    logger.info(f"Training samples: {len(train_ds)}")
-    logger.info(f"Batches per epoch: {len(train_loader)}")
 
     for epoch in range(start_epoch, config.num_epochs):
         train_sampler.set_epoch(epoch)
@@ -342,33 +306,18 @@ def main():
         
         if (epoch + 1) % config.eval_every == 0:
             metrics = validate(model, train_loader, tokenizer, grammar, config, device, logger)
-
             is_best = metrics['exact'] > best_exprate
             if is_best:
                 best_exprate = metrics['exact']
                 best_path = os.path.join(config.checkpoint_dir, 'best.pt')
-
-                # Save locally
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch + 1, metrics,
-                    best_path
-                )
-                # Push to Hugging Face
+                save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics, best_path)
                 push_checkpoint_to_hf(best_path, config, epoch + 1, is_best=True)
 
         if (epoch + 1) % config.save_every == 0:
             latest_path = os.path.join(config.checkpoint_dir, 'latest.pt')
             metrics_dict = metrics if 'metrics' in locals() else {}
-
-            # Save locally
-            save_checkpoint(
-                model, optimizer, scheduler, epoch + 1,
-                metrics_dict,
-                latest_path
-            )
-            # Push to Hugging Face
+            save_checkpoint(model, optimizer, scheduler, epoch + 1, metrics_dict, latest_path)
             push_checkpoint_to_hf(latest_path, config, epoch + 1, is_best=False)
-
 
 if __name__ == "__main__":
     main()
