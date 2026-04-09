@@ -23,8 +23,15 @@ class TAMERCore(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.encoder(images)
 
-    def forward(self, images, tgt_ids, tgt_parents, coverage=None):
-        memory = self.encode(images)
-        causal_mask = self.generate_causal_mask(tgt_ids.size(1), images.device)
+    def forward(self, images, tgt_ids, tgt_parents, coverage=None, text_only=False):
+        if text_only:
+            # PHASE 0: Bypass Encoder entirely. Send dummy visual memory.
+            B = tgt_ids.size(0)
+            # 256 is the sequence length output of the tiny swin encoder
+            memory = torch.zeros(B, 256, self.config.d_model, device=tgt_ids.device)
+        else:
+            memory = self.encode(images)
+            
+        causal_mask = self.generate_causal_mask(tgt_ids.size(1), tgt_ids.device)
         logits, pointer_scores, new_coverage = self.decoder(tgt_ids, tgt_parents, memory, causal_mask, coverage)
         return logits, pointer_scores, new_coverage

@@ -23,8 +23,12 @@ def calculate_metrics(pred_latex: str, gt_latex: str) -> dict:
     
     bracket_correct = int(pred_clean.count('{') == pred_clean.count('}'))
     
+    # SER (Symbol Error Rate) - OCR equivalent of MSE
+    ser = dist / max(len(list(gt_clean)), 1)
+    
     return {
         'exact': exact_match,
         'leq1': leq1,
-        'bracket': bracket_correct
+        'bracket': bracket_correct,
+        'ser': ser
     }
