@@ -23,7 +23,7 @@ def train_step(
     batch: Dict[str, Any],
     criterion: LabelSmoothedCELoss,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: "torch.cuda.amp.GradScaler",
     device: torch.device,
     accumulation_steps: int = 4,
     max_grad_norm: float = 1.0,
@@ -49,7 +49,7 @@ def train_step(
     images = batch['image'].to(device, non_blocking=True)
     ids = batch['ids'].to(device, non_blocking=True)
 
-    with torch.amp.autocast('cuda', dtype=torch.float16):
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
         logits = model(images, ids)
         loss = criterion(logits, ids)
         loss = loss / accumulation_steps
@@ -62,7 +62,7 @@ def train_step(
 def optimizer_step(
     model: TAMERModel,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: "torch.cuda.amp.GradScaler",
     scheduler=None,
     max_grad_norm: float = 1.0,
 ):
@@ -115,7 +115,7 @@ def eval_step(
     ids = batch['ids'].to(device)
 
     with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images, ids)
             loss = criterion(logits, ids)
 

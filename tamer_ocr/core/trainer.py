@@ -41,23 +41,8 @@ from ..data.sampler import (
     get_temperature_for_step,
 )
 
-# CORRECT
-from .preprocessor import DatasetPreprocessor
-
-
-# Replace the augmentation import with inline definitions:
-import torchvision.transforms as T
-
-def get_train_augmentation():
-    return T.Compose([
-        T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.95, 1.05)),
-        T.ToTensor(),
-    ])
-
-def get_val_augmentation():
-    return T.Compose([
-        T.ToTensor(),
-    ])
+from ..data.preprocessor import DatasetPreprocessor
+from ..data.augmentation import get_train_augmentation, get_val_augmentation
 
 from .losses import LabelSmoothedCELoss
 from .inference import beam_search, greedy_decode
@@ -322,7 +307,7 @@ class Trainer:
         self.logger.info(f"OneCycleLR: total_steps={total_steps}, pct_start={self.config.pct_start}")
 
         # AMP GradScaler
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scaler = torch.cuda.amp.GradScaler()
 
         self.logger.info("Model initialization complete.")
 
@@ -441,7 +426,7 @@ class Trainer:
         images = batch['image'].to(self.device, non_blocking=True)
         ids = batch['ids'].to(self.device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = self.model(images, ids)
             loss = self.criterion(logits, ids)
             loss = loss / self.config.accumulation_steps
@@ -471,7 +456,7 @@ class Trainer:
                 images = batch['image'].to(self.device)
                 ids = batch['ids'].to(self.device)
 
-                with torch.amp.autocast('cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
                     logits = self.model(images, ids)
                     loss = self.criterion(logits, ids)
                 total_loss += loss.item()

@@ -31,14 +31,14 @@ class Config:
         {
             "name": "im2latex",
             "type": "kaggle",
-            "kaggle_slug": "shahrukhkhan/im2latex",
+            "kaggle_slug": "shahrukhkhan/im2latex100k",
             "parser": "im2latex",
         },
         {
             "name": "mathwriting",
             "type": "huggingface",
-            "hf_repo": "MathInstruct/MathWriting",
-            "parser": "crohme",
+            "hf_repo": "deepcopy/MathWriting-human",
+            "parser": "mathwriting",
         },
     ])
     auto_download: bool = False
