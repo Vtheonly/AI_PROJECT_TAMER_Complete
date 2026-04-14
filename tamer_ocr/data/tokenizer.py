@@ -4,7 +4,7 @@ Builds a global vocabulary from all datasets. Special tokens are fixed at indice
 """
 import logging
 from collections import Counter
-from typing import List, Dict, Optional
+from typing import List, Dict
 import json
 import os
 

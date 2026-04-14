@@ -59,18 +59,14 @@ class SwinEncoder(nn.Module):
         if self.format == "BCHW":
             features = features.permute(0, 2, 3, 1)
         elif self.format == "BLC":
-            # FIX: Dynamically calculate Height and Width of feature map based on aspect ratio
-            L = features.shape[1]
-            ratio = self.config.img_width / self.config.img_height
-            H_feat = int((L / ratio) ** 0.5)
-            W_feat = int(H_feat * ratio)
+            # FIX: Dynamically calculate Height and Width based on exact 16x downsampling factor in stage 2
+            H_feat = self.config.img_height // 16
+            W_feat = self.config.img_width // 16
             features = features.view(B, H_feat, W_feat, -1)
         elif self.format == "BCL":
             features = features.permute(0, 2, 1)
-            L = features.shape[1]
-            ratio = self.config.img_width / self.config.img_height
-            H_feat = int((L / ratio) ** 0.5)
-            W_feat = int(H_feat * ratio)
+            H_feat = self.config.img_height // 16
+            W_feat = self.config.img_width // 16
             features = features.view(B, H_feat, W_feat, -1)
 
         features = self.proj(features)
