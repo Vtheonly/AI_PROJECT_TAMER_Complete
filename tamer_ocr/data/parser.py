@@ -323,6 +323,7 @@ class DatasetParser:
 
                     if img_col and img_col in item:
                         img = item[img_col]
+                        pil_img = None
                         if hasattr(img, 'convert'):
                             pil_img = img.convert('L')
                         elif isinstance(img, dict) and 'bytes' in img:
@@ -340,11 +341,14 @@ class DatasetParser:
                             h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                             img_path = os.path.join(img_dir, f"img_{idx}_{h}.png")
                             if not os.path.exists(img_path):
-                                pil_img.save(img_path)
+                                # CRITICAL FIX: explicitly copy to avoid _idat IOError from Pillow stream saving
+                                safe_img = pil_img.copy()
+                                safe_img.save(img_path, format="PNG")
                             samples.append({"image": img_path, "latex": latex, "dataset_name": "mathwriting"})
                         elif pil_img:
                             samples.append({"image": pil_img, "latex": latex, "dataset_name": "mathwriting"})
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Skipping corrupt HF image sample at index {idx}: {e}")
                     continue
 
         except Exception as e:
