@@ -1,76 +1,163 @@
+"""
+Standard Beam Search Inference for TAMER model.
+
+Key changes from old version:
+- NO grammar constraints
+- NO pointer scores
+- NO coverage tracking
+- Added length penalty to prevent short predictions
+"""
+
 import torch
 import torch.nn.functional as F
-from typing import List
-from data.tokenizer import LaTeXTokenizer
-from core.constraints import LaTeXGrammarConstraints
+from typing import List, Optional
+import logging
+
+logger = logging.getLogger("TAMER.Inference")
+
 
 @torch.no_grad()
-def constrained_beam_search(
-    model, image: torch.Tensor, tokenizer: LaTeXTokenizer, 
-    grammar: LaTeXGrammarConstraints, config
+def beam_search(
+    model,
+    image: torch.Tensor,
+    sos_id: int,
+    eos_id: int,
+    pad_id: int,
+    beam_width: int = 5,
+    max_len: int = 200,
+    length_penalty: float = 0.6,
+    device: torch.device = None,
 ) -> List[int]:
-    model.eval()
-    device = image.device
-    memory = model.encode(image)
+    """
+    Standard beam search decoding.
     
-    # Beam state: (tokens, parents, score, coverage)
-    beams = [([tokenizer.sos_id], [0], 0.0, None)]
+    Args:
+        model: TAMERModel instance
+        image: (1, 1, H, W) input image tensor
+        sos_id: Start-of-sequence token ID
+        eos_id: End-of-sequence token ID
+        pad_id: Padding token ID
+        beam_width: Number of beams
+        max_len: Maximum output sequence length
+        length_penalty: Penalty for short sequences (>0 encourages longer output)
+        device: Device for tensors
+    
+    Returns:
+        List of token IDs (excluding SOS and EOS)
+    """
+    model.eval()
+    if device is None:
+        device = image.device
+    
+    # Encode image once
+    memory = model.encode(image)  # (1, S, D)
+    
+    # Initialize beams: list of (tokens, log_prob)
+    beams = [([sos_id], 0.0)]
     completed = []
     
-    for step in range(config.max_seq_len):
+    for step in range(max_len):
         if not beams:
             break
-            
+        
         all_candidates = []
-        for tokens, parents, score, cov in beams:
-            if tokens[-1] == tokenizer.eos_id:
-                completed.append((tokens, parents, score))
+        
+        for tokens, score in beams:
+            # If this beam has ended, move to completed
+            if tokens[-1] == eos_id:
+                # Apply length penalty
+                length = len(tokens) - 1  # Exclude SOS
+                penalized_score = score / ((length ** length_penalty) if length > 0 else 1.0)
+                completed.append((tokens, penalized_score))
                 continue
-                
+            
+            # Prepare input
             tgt_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-            tgt_parents = torch.tensor([parents], dtype=torch.long, device=device)
-            causal_mask = model.generate_causal_mask(len(tokens), device)
             
-            logits, pointer_scores, new_cov = model.decoder(tgt_ids, tgt_parents, memory, causal_mask, cov)
+            # Generate causal mask
+            L = len(tokens)
+            tgt_mask = model.decoder.generate_causal_mask(L, device)
             
-            next_logits = logits[0, -1, :]
-            next_pointers = pointer_scores[0, -1, :step+1]
+            # Forward pass
+            logits = model.decoder(tgt_ids, memory, tgt_mask)  # (1, L, V)
+            next_logits = logits[0, -1, :]  # (V,)
             
-            if config.use_grammar_constraints:
-                mask = grammar.get_valid_mask(tokens)
-                next_logits[~mask.to(device)] = float('-inf')
-                
-            token_log_probs = F.log_softmax(next_logits, dim=-1)
-            pointer_log_probs = F.log_softmax(next_pointers, dim=-1)
+            # Log probabilities
+            log_probs = F.log_softmax(next_logits, dim=-1)
             
-            # Keep top-K tokens
-            topk_tokens = token_log_probs.topk(config.beam_width)
-            topk_ptrs = pointer_log_probs.topk(min(config.beam_width, len(pointer_log_probs)))
+            # Get top-k candidates
+            topk_log_probs, topk_indices = log_probs.topk(beam_width)
             
-            for tk_idx in range(len(topk_tokens.values)):
-                token_idx = topk_tokens.indices[tk_idx].item()
-                token_score = topk_tokens.values[tk_idx].item()
-                
-                # Assume best pointer for structural consistency
-                ptr_idx = topk_ptrs.indices[0].item()
-                ptr_score = topk_ptrs.values[0].item()
-                
-                combined_score = score + token_score + (config.pointer_loss_weight * ptr_score)
-                all_candidates.append(
-                    (tokens + [token_idx], parents + [ptr_idx], combined_score, new_cov)
-                )
-                
-        all_candidates.sort(key=lambda x: x[2], reverse=True)
-        beams = all_candidates[:config.beam_width]
+            for i in range(beam_width):
+                new_token = topk_indices[i].item()
+                new_score = score + topk_log_probs[i].item()
+                all_candidates.append((tokens + [new_token], new_score))
         
-        if all(b[0][-1] == tokenizer.eos_id for b in beams):
-            completed.extend([b[:3] for b in beams])
+        # Select top beam_width candidates
+        all_candidates.sort(key=lambda x: x[1], reverse=True)
+        beams = all_candidates[:beam_width]
+        
+        # Early termination if all beams ended
+        if all(b[0][-1] == eos_id for b in beams):
+            for tokens, score in beams:
+                length = len(tokens) - 1
+                penalized_score = score / ((length ** length_penalty) if length > 0 else 1.0)
+                completed.append((tokens, penalized_score))
             break
-            
+    
+    # If no completed beams, take the best incomplete one
     if not completed:
-        completed.extend([b[:3] for b in beams])
-        
-    completed.sort(key=lambda x: x[2], reverse=True)
+        for tokens, score in beams:
+            length = len(tokens) - 1
+            penalized_score = score / ((length ** length_penalty) if length > 0 else 1.0)
+            completed.append((tokens, penalized_score))
+    
+    # Select best
+    completed.sort(key=lambda x: x[1], reverse=True)
     best_tokens = completed[0][0]
     
-    return best_tokens[1:-1] if best_tokens[-1] == tokenizer.eos_id else best_tokens[1:]
+    # Remove SOS and EOS
+    if best_tokens[0] == sos_id:
+        best_tokens = best_tokens[1:]
+    if best_tokens and best_tokens[-1] == eos_id:
+        best_tokens = best_tokens[:-1]
+    
+    return best_tokens
+
+
+@torch.no_grad()
+def greedy_decode(
+    model,
+    image: torch.Tensor,
+    sos_id: int,
+    eos_id: int,
+    max_len: int = 200,
+    device: torch.device = None,
+) -> List[int]:
+    """Simple greedy decoding for fast inference."""
+    model.eval()
+    if device is None:
+        device = image.device
+    
+    memory = model.encode(image)
+    tokens = [sos_id]
+    
+    for _ in range(max_len):
+        tgt_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        L = len(tokens)
+        tgt_mask = model.decoder.generate_causal_mask(L, device)
+        
+        logits = model.decoder(tgt_ids, memory, tgt_mask)
+        next_token = logits[0, -1, :].argmax().item()
+        tokens.append(next_token)
+        
+        if next_token == eos_id:
+            break
+    
+    # Remove SOS and EOS
+    if tokens[0] == sos_id:
+        tokens = tokens[1:]
+    if tokens and tokens[-1] == eos_id:
+        tokens = tokens[:-1]
+    
+    return tokens

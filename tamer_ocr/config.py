@@ -1,5 +1,4 @@
 import os
-import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -10,63 +9,69 @@ class Config:
     output_dir: str = "./outputs"
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
-    
+    drive_backup_dir: str = ""  # Google Drive path for backup (e.g., "/content/drive/MyDrive/tamer_checkpoints")
+
     # Dataset Configuration
     datasets: List[str] = field(default_factory=lambda: [])
-    replay_datasets: List[str] = field(default_factory=lambda: [])
-    replay_ratio: float = 0.05  # 5% of batch comes from replay
     auto_download: bool = False
     skip_validation: bool = False
-    
-    # Image Settings
-    img_height: int = 128
-    img_width: int = 512
-    
-    # Model Architecture
-    encoder_name: str = "swinv2_tiny_window16_256"
-    d_model: int = 256
+
+    # Image Settings — FIXED: 256 height, 1024 width with aspect ratio preservation
+    img_height: int = 256
+    img_width: int = 1024
+
+    # Data Filtering
+    max_token_length: int = 150     # Discard samples with LaTeX longer than this
+    max_aspect_ratio: float = 10.0  # Discard images where w/h or h/w exceeds this
+
+    # Model Architecture — Swin-Base + Standard Transformer Decoder
+    encoder_name: str = "swin_base_patch4_window7_224"
+    d_model: int = 512
     nhead: int = 8
-    num_decoder_layers: int = 4
-    dim_feedforward: int = 1024
+    num_decoder_layers: int = 6
+    dim_feedforward: int = 2048
     dropout: float = 0.1
-    coverage_dim: int = 64
-    
+    encoder_feature_dim: int = 1024  # Swin-Base output dimension
+
     # Training Parameters
-    batch_size: int = 16
-    accumulation_steps: int = 2
+    batch_size: int = 8
+    accumulation_steps: int = 4  # Effective batch = 32
     num_workers: int = 2
     num_epochs: int = 150
-    lr: float = 3e-4
-    min_lr: float = 1e-6
+    encoder_lr: float = 1e-5
+    decoder_lr: float = 1e-4
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     label_smoothing: float = 0.1
-    
-    # SOTA Training Tricks
-    text_only_pretrain: bool = False    # Phase 0
-    freeze_encoder_epochs: int = 5      # Freeze Swin for N epochs
-    decoder_lr_multiplier: float = 1.0  # Used in later stages
-    encoder_lr_multiplier: float = 1.0  # Used in later stages
-    
-    # Scheduled Sampling (Exposure Bias Fix via Token Dropout)
-    ss_start_epoch: int = 20
-    ss_max_prob: float = 0.20           # Max 20% of tokens replaced
-    
-    # Loss Weights
-    seq_loss_weight: float = 1.0
-    pointer_loss_weight: float = 1.0
-    coverage_loss_weight: float = 0.5
-    
+
+    # Dynamic Temperature Sampling
+    temp_start: float = 0.8  # Start: upweight small datasets (CROHME)
+    temp_end: float = 0.4    # End: more uniform sampling
+
+    # OneCycleLR Scheduler
+    pct_start: float = 0.1   # 10% warmup
+
     # Inference
     max_seq_len: int = 200
     beam_width: int = 5
-    use_grammar_constraints: bool = True
-    
-    # Checkpointing
-    save_every: int = 1
+    length_penalty: float = 0.6  # Penalize short predictions
+
+    # Checkpointing — step-based for Colab session hopping
+    checkpoint_every_steps: int = 1000
+    keep_last_n_checkpoints: int = 3
     eval_every: int = 1
-    hf_repo_id: str = "JJKK1212/tamer-math-ocr"
-    
+
+    # HuggingFace
+    hf_repo_id: str = ""
+    hf_token: str = ""
+
+    # 72-Hour Schedule (step counts are approximate)
+    phase1_steps: int = 0        # Phase 1: Printed data only (Im2LaTeX + MathWriting)
+    phase2_start_step: int = 0   # Phase 2: Full mixture training (all datasets)
+    total_training_steps: int = 50000  # Rough estimate for 72 hours on T4
+
     def __post_init__(self):
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
             os.makedirs(path, exist_ok=True)
+        if self.drive_backup_dir:
+            os.makedirs(self.drive_backup_dir, exist_ok=True)

@@ -1,9 +1,18 @@
-from .constraints import LaTeXGrammarConstraints
-from .losses import TreeGuidedLoss
-from .inference import constrained_beam_search
+"""
+TAMER OCR Core Module.
 
-__all__ = [
-    'LaTeXGrammarConstraints',
-    'TreeGuidedLoss',
-    'constrained_beam_search'
-]
+All imports are lazy to avoid requiring torch at package import time.
+"""
+
+def __getattr__(name):
+    _LAZY_IMPORTS = {
+        'Trainer': '.trainer',
+        'LabelSmoothedCELoss': '.losses',
+        'beam_search': '.inference',
+        'greedy_decode': '.inference',
+    }
+    if name in _LAZY_IMPORTS:
+        import importlib
+        module = importlib.import_module(_LAZY_IMPORTS[name], package='tamer_ocr.core')
+        return getattr(module, name)
+    raise AttributeError(f"module 'tamer_ocr.core' has no attribute {name}")
