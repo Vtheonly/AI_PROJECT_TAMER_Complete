@@ -1,24 +1,24 @@
 """
-Main Training Pipeline for TAMER OCR v2.1.
+Main Training Pipeline for TAMER OCR v2.2.
 
-Changes from original:
-  - DataLoaders: added persistent_workers=True, prefetch_factor=2 (eliminates
-    worker respawn overhead; adds lookahead buffering; biggest single speedup)
-  - DataLoaders: num_workers pulled from config (now 4, was 2)
-  - HuggingFace push: now throttled to every hf_push_every_n_epochs epochs.
-    Previously pushed on every best checkpoint, blocking training with a
-    network call inside the hot evaluation path.
-  - Evaluation: now runs every config.eval_every epochs (default: 3), not
-    every epoch. Full greedy decode was eating 20-30% of wall-clock time.
-  - Evaluation: val set capped to eval_warmup_max_samples for the first
-    eval_warmup_epochs epochs, when the model output is still garbage anyway.
-  - evaluate_with_beam_search(): added as a public method (train.py calls it
-    in eval-only mode but it did not exist, causing an AttributeError).
-  - torch.compile(): optional, controlled by config.compile_model.
-  - GPU utilization logged at start of training so you know immediately
-    whether you're CPU-bound or GPU-bound.
-  - Removed gc.collect() + cuda.empty_cache() from the epoch loop.
-    These do not help and add measurable overhead on every epoch.
+Changes from v2.1:
+  - build_model(): Encoder freeze for the first config.freeze_encoder_epochs
+    epochs (default: 5). The decoder bootstraps on its own; encoder unfreezes
+    automatically at the right epoch with a log message confirming it.
+  - train(): Unfreeze logic injected at the top of the epoch loop — one clean
+    check, no extra state needed.
+  - Swin-v2 backbone is handled transparently: encoder.py reads channel counts
+    dynamically, so no changes are needed there.
+
+All v2.1 changes retained:
+  - DataLoaders: persistent_workers=True, prefetch_factor=2
+  - HuggingFace push: throttled to hf_push_every_n_epochs, background thread
+  - Evaluation: every config.eval_every epochs (default: 3)
+  - Evaluation: val set capped during eval_warmup_epochs
+  - evaluate_with_beam_search(): public method for --eval-only mode
+  - torch.compile(): optional, controlled by config.compile_model
+  - DataLoader profiler at training start
+  - Removed gc.collect() + cuda.empty_cache() from epoch loop
 
 Strict pipeline order:
   1. Preprocess ALL datasets (via DatasetPreprocessor)
@@ -226,7 +226,7 @@ class Trainer:
         # ----------------------------------------------------------------
         # persistent_workers=True — workers stay alive across epochs.
         #   Without this, all 4 workers are killed and respawned at the end
-        #   of every epoch. At 150 epochs, that's 600 unnecessary process
+        #   of every epoch. At 70 epochs, that's 280 unnecessary process
         #   spawns, each adding several seconds of startup overhead.
         #
         # prefetch_factor=2 — each worker pre-loads 2 batches ahead.
@@ -305,8 +305,12 @@ class Trainer:
 
     def build_model(self):
         """
-        Initialize Swin-Base encoder + Transformer decoder.
-        Applies differential learning rates and optional torch.compile().
+        Initialize Swin-v2 encoder + Transformer decoder (8 layers).
+
+        Applies:
+          - Differential learning rates (encoder 1e-5, decoder 1e-4)
+          - Optional encoder freeze for the first freeze_encoder_epochs epochs
+          - Optional torch.compile()
         """
         self.logger.info("=" * 70)
         self.logger.info("PHASE 2: Model Initialization")
@@ -328,6 +332,34 @@ class Trainer:
         self.logger.info(f"Trainable parameters: {trainable:,}")
         self.logger.info(f"Model size (fp32):    ~{total_params * 4 / 1e9:.2f} GB")
         self.logger.info(f"Model size (fp16):    ~{total_params * 2 / 1e9:.2f} GB")
+
+        # ----------------------------------------------------------------
+        # Encoder Freeze Warmup
+        #
+        # Freeze encoder weights for the first freeze_encoder_epochs epochs.
+        # Benefit: the randomly-initialised decoder can learn to read the
+        # encoder's existing feature map without destabilising it. Once the
+        # decoder has a reasonable representation, the encoder unfreezes and
+        # fine-tunes at its lower LR alongside the decoder.
+        #
+        # The optimizer still tracks frozen encoder params (so LR scheduling
+        # is consistent), but gradients for them are zero during the freeze.
+        # When unfreezing happens in train(), requires_grad is simply set back
+        # to True — no optimizer rebuild needed.
+        # ----------------------------------------------------------------
+        if self.config.freeze_encoder_epochs > 0:
+            for p in self.model.encoder.parameters():
+                p.requires_grad = False
+            trainable_after_freeze = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            frozen_count = trainable - trainable_after_freeze
+            self.logger.info(
+                f"Encoder FROZEN for epochs 1-{self.config.freeze_encoder_epochs} "
+                f"({frozen_count:,} params frozen, {trainable_after_freeze:,} active)"
+            )
+        else:
+            self.logger.info("Encoder freeze disabled (freeze_encoder_epochs=0)")
 
         encoder_params = list(self.model.encoder.parameters())
         decoder_params = list(self.model.decoder.parameters())
@@ -383,9 +415,13 @@ class Trainer:
             f"Effective batch: {self.config.batch_size * self.config.accumulation_steps} | "
             f"Eval every: {self.config.eval_every} epochs"
         )
+        if self.config.freeze_encoder_epochs > 0:
+            self.logger.info(
+                f"Encoder freeze: epochs 1-{self.config.freeze_encoder_epochs}, "
+                f"then full fine-tuning"
+            )
 
         # Profile the DataLoader before training starts.
-        # If this is slow (>2s for one batch), the bottleneck is I/O, not GPU.
         self._profile_dataloader()
 
         self.model.train()
@@ -394,6 +430,26 @@ class Trainer:
 
         for epoch in range(self.current_epoch, self.config.num_epochs):
             self.current_epoch = epoch + 1  # 1-indexed
+
+            # ----------------------------------------------------------------
+            # Encoder Unfreeze
+            # At the start of epoch (freeze_encoder_epochs + 1), re-enable
+            # gradients for the encoder. The optimizer already tracks its
+            # params, so no rebuild is needed — just flip requires_grad.
+            # ----------------------------------------------------------------
+            if (self.config.freeze_encoder_epochs > 0 and
+                    self.current_epoch == self.config.freeze_encoder_epochs + 1):
+                for p in self.model.encoder.parameters():
+                    p.requires_grad = True
+                newly_trainable = sum(
+                    p.numel() for p in self.model.encoder.parameters()
+                )
+                self.logger.info(
+                    f"*** Epoch {self.current_epoch}: Encoder UNFROZEN — "
+                    f"{newly_trainable:,} encoder params now training at "
+                    f"LR={self.config.encoder_lr:.1e} ***"
+                )
+
             self.epoch_start_time = time.time()
             epoch_loss = 0.0
             epoch_steps = 0
@@ -468,11 +524,20 @@ class Trainer:
 
             epoch_time = time.time() - self.epoch_start_time
             avg_loss = epoch_loss / max(epoch_steps, 1)
+
+            # Indicate encoder freeze status in the epoch summary line
+            enc_status = (
+                "FROZEN" if (
+                    self.config.freeze_encoder_epochs > 0 and
+                    self.current_epoch <= self.config.freeze_encoder_epochs
+                ) else "active"
+            )
             self.logger.info(
                 f"Epoch {self.current_epoch} done | "
                 f"Loss: {avg_loss:.4f} | "
                 f"Time: {epoch_time / 60:.1f} min | "
-                f"Step: {self.global_step}"
+                f"Step: {self.global_step} | "
+                f"Encoder: {enc_status}"
             )
 
             # ----------------------------------------------------------------
@@ -553,7 +618,6 @@ class Trainer:
         )
 
         # Early stopping on edit distance (lower is better).
-        # Exact match is too harsh early in training (it's 0.0 for many epochs).
         is_best = metrics['edit_dist'] < self.best_edit_dist
         if is_best:
             self.best_exp_rate = metrics['exact_match']
@@ -571,10 +635,6 @@ class Trainer:
                 best_path,
             )
 
-            # Push to HF only every hf_push_every_n_epochs epochs.
-            # Previously this fired on every best checkpoint, blocking training
-            # with a network call. Now it fires in a background thread AND
-            # only if we haven't pushed recently.
             should_push = (
                 self.current_epoch - self._last_hf_push_epoch
                 >= self.config.hf_push_every_n_epochs

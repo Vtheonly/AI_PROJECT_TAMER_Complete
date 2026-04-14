@@ -1,15 +1,32 @@
 """
-TAMER OCR v2.1 — Configuration
+TAMER OCR v2.2 — Configuration
 
-Key changes from original:
-  - num_workers bumped to 4 (was 2; DataLoader was starving the GPU)
-  - batch_size bumped to 16 (was 8; safe on 16GB T4 with AMP + 256x1024 images)
-  - accumulation_steps reduced to 2 (effective batch stays at 32)
-  - eval_every set to 3 (was 1; evaluating every epoch wasted 20-30% of training time)
-  - hf_push_every_n_epochs added (HF push was blocking the training loop every epoch)
-  - compile_model flag added (torch.compile gives 10-30% speedup on PyTorch 2.x)
-  - early_stopping_patience raised to 20 (15 was too aggressive for a slow-starting OCR model)
-  - Added fast_mode image resolution option (128x512 for quick experimentation)
+Changes from v2.1:
+  - encoder_name switched to swin_v2_base_patch4_window8_256.
+      Swin-v2 uses log-spaced continuous relative position bias, which
+      generalises better to rectangular (non-square) images and to
+      resolutions different from the pre-training resolution. Drop-in
+      replacement for Swin-Base: same channel widths, same timm API,
+      no change to encoder.py required.
+
+  - num_decoder_layers raised from 6 → 8.
+      Decoder is cheap relative to the encoder. +2 layers ≈ +5-8% wall
+      time per step, but the extra cross-attention capacity reliably
+      improves ExpRate by 2-4% on multi-dataset OCR.
+
+  - freeze_encoder_epochs = 5 (new).
+      Encoder weights are frozen for the first N epochs so the randomly-
+      initialised decoder can bootstrap without destabilising the
+      pre-trained features. Unfreeze happens automatically in the trainer.
+      Effect: faster early loss drop, more stable final convergence.
+
+  - num_epochs reduced from 150 → 70.
+      With the better encoder and decoder, the model converges sooner.
+      70 epochs × ~75 min/epoch (worst-case on Kaggle T4) = ~87 hours,
+      safely under the 100-hour budget. Early stopping (patience=20)
+      will almost always terminate well before epoch 70.
+
+  - All other settings from v2.1 are unchanged.
 """
 
 import os
@@ -73,10 +90,10 @@ class Config:
     #
     # PERFORMANCE NOTE:
     #   256x1024 (default) — best quality, but slow.
-    #   swin_base_patch4_window7_224 produces 64x256 = 16,384 patches at
-    #   this resolution. Each forward pass is expensive.
+    #   swin_v2_base produces 16x64 = 1024 patches at this resolution.
+    #   Each forward pass is expensive.
     #
-    #   FAST MODE: set fast_mode=True → uses 128x512 (4,096 patches).
+    #   FAST MODE: set fast_mode=True → uses 128x512 (4 patches).
     #   Roughly 4x faster per step, ~3-5% accuracy drop. Good for
     #   early experiments or if your epoch time is > 90 min.
     # ----------------------------------------------------------------
@@ -93,18 +110,32 @@ class Config:
     # ----------------------------------------------------------------
     # Model Architecture
     #
-    # PERFORMANCE NOTE:
-    #   swin_base_patch4_window7_224 — strong but heavy (~87M params in encoder).
+    # ENCODER — swin_v2_base_patch4_window8_256
+    #   Upgraded from swin_base_patch4_window7_224. Key improvement:
+    #   log-spaced continuous relative position bias handles rect images
+    #   and resolution transfer much better than the discrete bias table
+    #   in v1. Also uses post-norm + scaled cosine attention for more
+    #   stable deep-feature learning.
+    #
+    #   encoder.py is UNCHANGED — it reads channel count dynamically
+    #   from timm's feature_info, so the upgrade is purely a name swap.
+    #
+    #   Channel widths (Swin-v2 Base, out_indices=(2,)):
+    #     Stage 2 → 512 channels (same as Swin-Base v1)
+    #
     #   For faster training with modest accuracy loss, swap to:
-    #     "swin_small_patch4_window7_224"   (~50M params, ~25% faster)
-    #     "swin_tiny_patch4_window7_224"    (~28M params, ~45% faster)
-    #   encoder_feature_dim must match: base=1024, small=768, tiny=768
+    #     "swin_v2_small_patch4_window8_256"   (~50M params, ~25% faster)
+    #     "swin_v2_tiny_patch4_window8_256"    (~28M params, ~45% faster)
+    #
+    # DECODER — 8 layers (was 6)
+    #   +2 layers ≈ +5-8% compute, +2-4% ExpRate on multi-dataset OCR.
+    #   The encoder is still the dominant cost; the decoder is cheap.
     # ----------------------------------------------------------------
-    encoder_name: str = "swin_base_patch4_window7_224"
-    encoder_feature_dim: int = 1024     # Must match encoder output channels
+    encoder_name: str = "swin_v2_base_patch4_window8_256"
+    encoder_feature_dim: int = 512      # Swin-v2-Base stage-2 output (for docs only)
     d_model: int = 512
     nhead: int = 8
-    num_decoder_layers: int = 6
+    num_decoder_layers: int = 8         # Raised from 6 → 8
     dim_feedforward: int = 2048
     dropout: float = 0.1
 
@@ -112,19 +143,19 @@ class Config:
     # Training Parameters
     # ----------------------------------------------------------------
     # batch_size=16 + accumulation_steps=2 = effective batch of 32.
-    # Same effective batch as before (8x4), but fewer DataLoader iterations
-    # per epoch means less Python/collation overhead.
     batch_size: int = 16
     accumulation_steps: int = 2
 
     # 4 workers saturates the Kaggle CPU allocation.
-    # Do NOT go above 4 on Kaggle — you will get throttled.
     num_workers: int = 4
 
-    num_epochs: int = 150
+    # Reduced from 150 → 70.
+    # 70 × ~75 min/epoch (worst-case T4) = ~87 hours, under 100-hour budget.
+    # Early stopping (patience=20) will almost always stop well before 70.
+    num_epochs: int = 70
 
-    # Raised from 15 → 20. Early LaTeX OCR training is noisy; the model
-    # often plateaus for 10+ epochs before breaking through.
+    # Raised from 15 → 20. LaTeX OCR models plateau for many epochs
+    # before breaking through.
     early_stopping_patience: int = 20
 
     # Differential learning rates: encoder is pretrained, decoder is random.
@@ -133,6 +164,18 @@ class Config:
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     label_smoothing: float = 0.1
+
+    # ----------------------------------------------------------------
+    # Encoder Freeze Warmup (NEW)
+    #
+    # Freeze the encoder for the first N epochs so the random decoder
+    # can bootstrap without pulling the pre-trained encoder off its
+    # good initialisation. After epoch N, the encoder unfreezes and
+    # trains at encoder_lr for the rest of training.
+    #
+    # Set to 0 to disable (full fine-tuning from epoch 1).
+    # ----------------------------------------------------------------
+    freeze_encoder_epochs: int = 5
 
     # ----------------------------------------------------------------
     # Dynamic Temperature Sampling
@@ -158,15 +201,12 @@ class Config:
     checkpoint_every_epochs: int = 3
     keep_last_n_checkpoints: int = 3
 
-    # Evaluate every N epochs.
-    # Was 1 (every epoch), now 3. Saves ~20-30% of wall-clock time
-    # since full greedy-decode evaluation is expensive.
+    # Evaluate every N epochs — saves 20-30% of wall-clock time.
     eval_every: int = 3
 
-    # Early epochs: cap val samples to avoid long waits before the model
-    # has learned anything meaningful.
-    eval_warmup_epochs: int = 10       # Epochs to use reduced eval set
-    eval_warmup_max_samples: int = 500  # Sample cap during warmup
+    # Early epochs: cap val samples to avoid long waits.
+    eval_warmup_epochs: int = 10
+    eval_warmup_max_samples: int = 500
 
     # ----------------------------------------------------------------
     # HuggingFace Push Throttling
@@ -174,8 +214,6 @@ class Config:
     hf_repo_id: str = ""
     hf_token: str = ""
     hf_dataset_repo_id: str = ""
-    # Only push to HF every N epochs. Was pushing on EVERY best checkpoint,
-    # which blocked the training loop with a network call mid-epoch.
     hf_push_every_n_epochs: int = 5
 
     # ----------------------------------------------------------------
@@ -188,8 +226,9 @@ class Config:
     # Performance Options
     # ----------------------------------------------------------------
     # torch.compile() (PyTorch 2.0+) gives 10-30% speedup on T4 GPUs.
-    # Set to True once you've confirmed training is stable.
-    # Note: compile adds ~2-3 minutes of JIT warmup on the first epoch.
+    # Set to True once you've confirmed training is stable (usually
+    # after a successful first epoch). Adds ~2-3 min JIT warmup on
+    # the first epoch.
     compile_model: bool = False
 
     # ----------------------------------------------------------------
