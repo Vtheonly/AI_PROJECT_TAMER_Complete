@@ -7,6 +7,7 @@ import os
 import glob
 import json
 import logging
+import numpy as np
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from PIL import Image, ImageDraw
@@ -341,8 +342,9 @@ class DatasetParser:
                             h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                             img_path = os.path.join(img_dir, f"img_{idx}_{h}.png")
                             if not os.path.exists(img_path):
-                                # CRITICAL FIX: explicitly copy to avoid _idat IOError from Pillow stream saving
-                                safe_img = pil_img.copy()
+                                # CRITICAL FIX: Convert to Numpy Array and back to break HF _idat references 
+                                # This fully solves the "AttributeError: '_idat' object has no attribute 'fileno'" error
+                                safe_img = Image.fromarray(np.array(pil_img))
                                 safe_img.save(img_path, format="PNG")
                             samples.append({"image": img_path, "latex": latex, "dataset_name": "mathwriting"})
                         elif pil_img:

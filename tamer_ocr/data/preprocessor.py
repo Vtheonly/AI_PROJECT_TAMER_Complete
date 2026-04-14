@@ -8,8 +8,6 @@ Implements the STRICT pipeline:
   4. Create or reuse a HuggingFace dataset repository
   5. Push the FULL processed dataset to HuggingFace
   6. Only AFTER dataset is uploaded and verified → signal ready for training
-
-CRITICAL: No training starts before all 4 datasets are preprocessed and pushed to HF.
 """
 
 import os
@@ -31,7 +29,6 @@ logger = logging.getLogger("TAMER.Preprocessor")
 
 
 def _get_memory_usage_mb() -> float:
-    """Get current process memory usage in MB."""
     try:
         import psutil
         process = psutil.Process(os.getpid())
@@ -41,20 +38,12 @@ def _get_memory_usage_mb() -> float:
 
 
 def _log_memory(context: str):
-    """Log current memory usage."""
     mem = _get_memory_usage_mb()
     if mem > 0:
         logger.info(f"  Memory ({context}): {mem:.0f} MB")
 
 
 class DatasetPreprocessor:
-    """
-    Full dataset preprocessing pipeline.
-
-    Downloads, normalizes, filters, and pushes all datasets to HF.
-    This runs BEFORE any model or training code is initialized.
-    """
-
     def __init__(self, config):
         self.config = config
         self.data_dir = config.data_dir
@@ -62,20 +51,13 @@ class DatasetPreprocessor:
         self.downloader = AdvDownloader(config)
         self.tokenizer = LaTeXTokenizer()
 
-        # Processed data directory
         self.processed_dir = os.path.join(self.data_dir, "processed")
         os.makedirs(self.processed_dir, exist_ok=True)
 
-        # Manifest file — tracks which datasets have been processed & pushed
         self.manifest_path = os.path.join(self.processed_dir, "manifest.json")
         self.manifest = self._load_manifest()
 
-        # Cache for HF dataset objects (avoid re-downloading)
         self._hf_cache = {}
-
-    # ----------------------------------------------------------------
-    # MANIFEST — tracks preprocessing state
-    # ----------------------------------------------------------------
 
     def _load_manifest(self) -> Dict[str, Any]:
         if os.path.exists(self.manifest_path):
@@ -95,15 +77,7 @@ class DatasetPreprocessor:
         with open(self.manifest_path, 'w') as f:
             json.dump(self.manifest, f, indent=2, ensure_ascii=False)
 
-    # ----------------------------------------------------------------
-    # STEP 1: Download datasets
-    # ----------------------------------------------------------------
-
     def download_all_datasets(self) -> Dict[str, Any]:
-        """
-        Download datasets configured in config.py.
-        Returns mapping of dataset_name -> source path or HF object
-        """
         logger.info("=" * 70)
         logger.info("STEP 1: Downloading all datasets")
         logger.info("=" * 70)
@@ -134,15 +108,21 @@ class DatasetPreprocessor:
                     logger.error(f"Download failed for {name}: {e}")
                     dataset_sources[name] = None
                     
+            elif ds_type == 'url':
+                url = ds.get('url')
+                extract_dir = os.path.join(self.data_dir, name)
+                try:
+                    logger.info(f"Downloading {name} from URL ({url})...")
+                    self.downloader.download_zenodo_zip(url, extract_dir)
+                    dataset_sources[name] = extract_dir
+                except Exception as e:
+                    logger.error(f"Download failed for {name}: {e}")
+                    dataset_sources[name] = None
+                    
         logger.info("All datasets downloaded!")
         return dataset_sources
 
-    # ----------------------------------------------------------------
-    # STEP 2: Preprocess all datasets
-    # ----------------------------------------------------------------
-
     def preprocess_all_datasets(self, dataset_sources: Dict[str, Any]) -> Dict[str, List[Dict]]:
-        """Preprocess ALL datasets completely before any training."""
         logger.info("=" * 70)
         logger.info("STEP 2: Preprocessing ALL datasets")
         logger.info("=" * 70)
@@ -155,7 +135,6 @@ class DatasetPreprocessor:
                 all_processed[dataset_name] = []
                 continue
 
-            # Check if already processed from a previous run
             if self.manifest['datasets'].get(dataset_name, {}).get('preprocessed', False):
                 cached = self._load_processed_cache(dataset_name)
                 if cached:
@@ -171,22 +150,18 @@ class DatasetPreprocessor:
             logger.info(f"{dataset_name}: {len(samples)} valid samples after preprocessing")
             _log_memory(f"after {dataset_name}")
 
-            # Save to disk
             self._save_processed_cache(dataset_name, samples)
 
-            # Update manifest
             self.manifest['datasets'][dataset_name] = {
                 'preprocessed': True,
                 'sample_count': len(samples),
             }
             self._save_manifest()
 
-            # Free memory
             gc.collect()
 
             all_processed[dataset_name] = samples
 
-        # Build global tokenizer from ALL processed data
         self._build_tokenizer(all_processed)
 
         total = sum(len(v) for v in all_processed.values())
@@ -198,11 +173,9 @@ class DatasetPreprocessor:
         return all_processed
 
     def _preprocess_single_dataset(self, dataset_name: str, source: Any) -> List[Dict]:
-        """Preprocess a single dataset. Source can be a path (str) or HF dataset object."""
         samples = []
 
         try:
-            # Match parser based on config
             parser_name = next((ds.get('parser') for ds in self.config.datasets if ds.get('name') == dataset_name), dataset_name)
             
             raw_samples = []
@@ -225,11 +198,9 @@ class DatasetPreprocessor:
 
             logger.info(f"  {dataset_name}: {len(raw_samples)} raw samples parsed")
 
-            # Normalize LaTeX and filter
             processed = normalize_corpus(raw_samples)
             logger.info(f"  {dataset_name}: {len(processed)} samples after normalization")
 
-            # Filter by token length
             filtered = []
             for s in processed:
                 latex = s.get('latex', '')
@@ -241,7 +212,6 @@ class DatasetPreprocessor:
 
             logger.info(f"  {dataset_name}: {len(filtered)} samples after token length filter")
 
-            # Validate images exist (for file-based samples)
             validated = []
             for s in filtered:
                 img = s.get('image')
@@ -252,7 +222,6 @@ class DatasetPreprocessor:
             logger.info(f"  {dataset_name}: {len(validated)} samples after image validation")
             samples = validated
 
-            # Free raw data
             del raw_samples
             del processed
             del filtered
@@ -266,7 +235,6 @@ class DatasetPreprocessor:
         return samples
 
     def _build_tokenizer(self, all_processed: Dict[str, List[Dict]]):
-        """Build global tokenizer from ALL processed samples."""
         logger.info("Building global tokenizer from ALL processed data...")
         all_samples = []
         for samples in all_processed.values():
@@ -282,12 +250,7 @@ class DatasetPreprocessor:
 
         logger.info(f"Tokenizer built: {len(self.tokenizer)} tokens")
 
-    # ----------------------------------------------------------------
-    # STEP 3: Verify dataset
-    # ----------------------------------------------------------------
-
     def verify_dataset(self, all_processed: Dict[str, List[Dict]]) -> bool:
-        """Verify the entire dataset is clean, processed, and ready for training."""
         logger.info("=" * 70)
         logger.info("STEP 3: Verifying dataset integrity")
         logger.info("=" * 70)
@@ -322,12 +285,7 @@ class DatasetPreprocessor:
         logger.info("VERIFICATION PASSED — dataset is clean and ready!")
         return True
 
-    # ----------------------------------------------------------------
-    # STEP 4 & 5: Push to HuggingFace Dataset Repository
-    # ----------------------------------------------------------------
-
     def push_to_huggingface(self, all_processed: Dict[str, List[Dict]]) -> bool:
-        """Push the FULL processed dataset to a HuggingFace dataset repository."""
         logger.info("=" * 70)
         logger.info("STEP 4/5: Pushing processed dataset to HuggingFace")
         logger.info("=" * 70)
@@ -397,7 +355,6 @@ class DatasetPreprocessor:
             return False
 
     def _save_jsonl(self, samples: List[Dict], path: str):
-        """Save samples as JSONL (one JSON per line)."""
         with open(path, 'w', encoding='utf-8') as f:
             for s in samples:
                 cacheable = {
@@ -407,12 +364,7 @@ class DatasetPreprocessor:
                 }
                 f.write(json.dumps(cacheable, ensure_ascii=False) + '\n')
 
-    # ----------------------------------------------------------------
-    # Load from HF (for training resumption)
-    # ----------------------------------------------------------------
-
     def load_from_huggingface(self) -> Optional[Dict[str, List[Dict]]]:
-        """Load preprocessed dataset from HuggingFace (for session resumption)."""
         hf_token = self.config.hf_token or os.getenv('HF_TOKEN', '')
         hf_repo = self.config.hf_dataset_repo_id
 
@@ -462,7 +414,6 @@ class DatasetPreprocessor:
         return None
 
     def _load_jsonl(self, path: str) -> List[Dict]:
-        """Load samples from JSONL file."""
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -473,10 +424,6 @@ class DatasetPreprocessor:
                     except json.JSONDecodeError:
                         continue
         return samples
-
-    # ----------------------------------------------------------------
-    # Cache helpers
-    # ----------------------------------------------------------------
 
     def _save_processed_cache(self, dataset_name: str, samples: List[Dict]):
         cache_path = os.path.join(self.processed_dir, f"{dataset_name}.jsonl")
@@ -489,22 +436,13 @@ class DatasetPreprocessor:
             return self._load_jsonl(cache_path)
         return None
 
-    # ----------------------------------------------------------------
-    # MAIN PIPELINE — strict sequence
-    # ----------------------------------------------------------------
-
     def run_full_pipeline(self) -> Tuple[Dict[str, List[Dict]], LaTeXTokenizer]:
-        """
-        Run the FULL preprocessing pipeline in strict order.
-        """
-        # Check if already done
         if self.manifest.get('all_preprocessed') and self.manifest.get('pushed_to_hf'):
             logger.info("Dataset already preprocessed and pushed. Loading from HF...")
             cached = self.load_from_huggingface()
             if cached:
                 return cached, self.tokenizer
 
-            # HF load failed — try local cache
             logger.info("HF load failed, trying local cache...")
             all_processed = {}
             for ds in self.config.datasets:
@@ -521,17 +459,12 @@ class DatasetPreprocessor:
                     self.push_to_huggingface(all_processed)
                     return all_processed, self.tokenizer
 
-        # STEP 1: Download
         dataset_sources = self.download_all_datasets()
-
-        # STEP 2: Preprocess ALL
         all_processed = self.preprocess_all_datasets(dataset_sources)
 
-        # STEP 3: Verify
         if not self.verify_dataset(all_processed):
             raise RuntimeError("Dataset verification FAILED — fix issues before training")
 
-        # STEP 4/5: Push to HF
         success = self.push_to_huggingface(all_processed)
         if not success:
             logger.warning("HF push failed — training will proceed with local data only")

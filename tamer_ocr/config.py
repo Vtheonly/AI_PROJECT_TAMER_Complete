@@ -2,7 +2,6 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-# At the top of config.py, outside the class:
 _DEFAULT_DATA_ROOT = "/content/tamer_data" if os.path.isdir("/content") else "/kaggle/working/tamer_data"
 
 @dataclass
@@ -18,14 +17,14 @@ class Config:
     datasets: List[dict] = field(default_factory=lambda: [
         {
             "name": "crohme",
-            "type": "kaggle",
-            "kaggle_slug": "nguyenvo0921/crohme",
+            "type": "url",  # <--- CHANGED from kaggle to url to bypass 403
+            "url": "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1",
             "parser": "crohme",
         },
         {
             "name": "hme100k",
             "type": "kaggle",
-            "kaggle_slug": "muhammadhanif/hme100k",
+            "kaggle_slug": "prajwalchy/hme100k-dataset", # <--- Correct slug
             "parser": "hme100k",
         },
         {
@@ -49,8 +48,8 @@ class Config:
     img_width: int = 1024
 
     # Data Filtering
-    max_token_length: int = 150     # Discard samples with LaTeX longer than this
-    max_aspect_ratio: float = 10.0  # Discard images where w/h or h/w exceeds this
+    max_token_length: int = 150     
+    max_aspect_ratio: float = 10.0  
 
     # Model Architecture — Swin-Base + Standard Transformer Decoder
     encoder_name: str = "swin_base_patch4_window7_224"
@@ -59,11 +58,11 @@ class Config:
     num_decoder_layers: int = 6
     dim_feedforward: int = 2048
     dropout: float = 0.1
-    encoder_feature_dim: int = 1024  # Swin-Base output dimension
+    encoder_feature_dim: int = 1024 
 
     # Training Parameters
     batch_size: int = 8
-    accumulation_steps: int = 4  # Effective batch = 32
+    accumulation_steps: int = 4  
     num_workers: int = 2
     num_epochs: int = 150
     encoder_lr: float = 1e-5
@@ -73,38 +72,34 @@ class Config:
     label_smoothing: float = 0.1
 
     # Dynamic Temperature Sampling
-    temp_start: float = 0.8  # Start: upweight small datasets (CROHME)
-    temp_end: float = 0.4    # End: more uniform sampling
+    temp_start: float = 0.8  
+    temp_end: float = 0.4    
 
     # OneCycleLR Scheduler
-    pct_start: float = 0.1   # 10% warmup
+    pct_start: float = 0.1   
 
     # Inference
     max_seq_len: int = 200
     beam_width: int = 5
-    length_penalty: float = 0.6  # Penalize short predictions
+    length_penalty: float = 0.6  
 
-    # Checkpointing — epoch-based, save every N epochs, auto-resume from latest
+    # Checkpointing
     checkpoint_every_epochs: int = 3
     keep_last_n_checkpoints: int = 3
     eval_every: int = 1
 
-    # HuggingFace — Model Checkpoints
+    # HuggingFace
     hf_repo_id: str = ""
     hf_token: str = ""
-
-    # HuggingFace — Processed Dataset Repository
-    hf_dataset_repo_id: str = ""   # e.g. "username/tamer-preprocessed"
-    # If empty, defaults to "{hf_username}/tamer-preprocessed"
+    hf_dataset_repo_id: str = ""   
 
     # Kaggle
     kaggle_username: str = "merselfares"
     kaggle_key: str = ""
 
-    # 72-Hour Schedule (step counts are approximate)
-    phase1_steps: int = 0        # Phase 1: Printed data only (Im2LaTeX + MathWriting)
-    phase2_start_step: int = 0   # Phase 2: Full mixture training (all datasets)
-    total_training_steps: int = 50000  # Rough estimate for 72 hours on T4
+    phase1_steps: int = 0        
+    phase2_start_step: int = 0   
+    total_training_steps: int = 50000 
 
     def __post_init__(self):
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
