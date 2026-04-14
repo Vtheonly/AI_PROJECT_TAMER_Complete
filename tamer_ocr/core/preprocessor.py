@@ -133,7 +133,7 @@ class DatasetPreprocessor:
     # ─── Preprocess ────────────────────────────────────────
 
     def _preprocess_all(self, datasets):
-        from ..data.latex_normalizer import LaTeXNormalizer
+        from ..data.data_manager import LaTeXNormalizer
         from ..data.tokenizer import Tokenizer
 
         normalizer = LaTeXNormalizer()
