@@ -23,8 +23,9 @@ class DatasetPreprocessor:
 
     def __init__(self, config: Config):
         self.config = config
-        self.raw_dir = os.path.join(config.data_root, "raw")
-        self.processed_dir = os.path.join(config.data_root, "processed")
+        data_root = getattr(config, 'data_root', None) or getattr(config, 'data_dir', None) or '/kaggle/working/tamer_data'
+        self.raw_dir = os.path.join(data_root, "raw")
+        self.processed_dir = os.path.join(data_root, "processed")
         os.makedirs(self.raw_dir, exist_ok=True)
         os.makedirs(self.processed_dir, exist_ok=True)
 
@@ -209,7 +210,7 @@ class DatasetPreprocessor:
         from huggingface_hub import HfApi, create_repo
 
         api = HfApi(token=self.config.hf_token)
-        repo_id = self.config.hf_dataset_repo
+        repo_id = getattr(self.config, 'hf_dataset_repo_id', None) or getattr(self.config, 'hf_dataset_repo', '')
 
         # Create repo if it doesn't exist
         try:

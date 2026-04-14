@@ -2,9 +2,13 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+# At the top of config.py, outside the class:
+_DEFAULT_DATA_ROOT = "/content/tamer_data" if os.path.isdir("/content") else "/kaggle/working/tamer_data"
+
 @dataclass
 class Config:
     # Paths
+    data_root: str = _DEFAULT_DATA_ROOT
     data_dir: str = "./data"
     output_dir: str = "./outputs"
     checkpoint_dir: str = "./checkpoints"
