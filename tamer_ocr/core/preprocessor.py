@@ -30,7 +30,7 @@ class DatasetPreprocessor:
 
     # ─── Public API ────────────────────────────────────────
 
-    def run(self):
+    def run_full_pipeline(self):
         """Execute the full strict pipeline. Training must NOT start before this completes."""
         print("=" * 60)
         print("STARTING STRICT PREPROCESSING PIPELINE")
@@ -57,6 +57,22 @@ class DatasetPreprocessor:
         print("\n" + "=" * 60)
         print("PREPROCESSING PIPELINE COMPLETE — Ready for training")
         print("=" * 60)
+
+        # Load all processed data and build tokenizer
+        from ..data.tokenizer import LaTeXTokenizer as Tokenizer
+        tokenizer = Tokenizer()
+
+        all_processed = []
+        for ds in self.config.datasets:
+            name = ds.get("name", "unknown")
+            data_file = os.path.join(self.processed_dir, name, "data.json")
+            if os.path.isfile(data_file):
+                import json
+                with open(data_file, "r", encoding="utf-8") as f:
+                    samples = json.load(f)
+                all_processed.extend(samples)
+
+        return all_processed, tokenizer
 
     # ─── Download ──────────────────────────────────────────
 
