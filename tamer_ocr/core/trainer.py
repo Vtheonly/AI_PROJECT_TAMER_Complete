@@ -13,6 +13,7 @@ Strict pipeline order:
 import os
 import time
 import gc
+import math
 import logging
 import random
 from typing import Dict, Optional, Any, List, Tuple
@@ -35,13 +36,12 @@ from ..data.preprocessor import DatasetPreprocessor
 from ..data.augmentation import get_train_augmentation, get_val_augmentation
 
 from .losses import LabelSmoothedCELoss
-from .inference import beam_search, greedy_decode
+from .engine import train_step, optimizer_step, evaluate_full
 from ..utils.checkpoint import (
     save_checkpoint, load_checkpoint,
     find_latest_checkpoint, cleanup_old_checkpoints,
     push_checkpoint_to_hf,
 )
-from ..utils.metrics import compute_batch_metrics
 from ..logger import setup_logger
 
 logger = logging.getLogger("TAMER.Trainer")
@@ -75,7 +75,9 @@ class Trainer:
         # Optimizer & Scheduler
         self.optimizer = None
         self.scheduler = None
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        
+        # FIX: Modern PyTorch 2.0+ AMP GradScaler API
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         # Loss
         self.criterion = LabelSmoothedCELoss(
@@ -141,7 +143,7 @@ class Trainer:
 
         self.logger.info(f"After token length filter: {len(filtered)}")
 
-        # FIX: Stratified split per dataset to maintain distribution and ensure contiguous ranges
+        # Stratified split per dataset to maintain distribution
         grouped = {}
         for s in filtered:
             ds = s.get('dataset_name', 'unknown')
@@ -152,12 +154,17 @@ class Trainer:
         self.train_samples = []
         self.val_samples = []
 
+        # FIX: Instantiate RNG once outside the loop
+        rng = random.Random(42)
         for ds, ds_samples in grouped.items():
-            random.seed(42)
-            random.shuffle(ds_samples)
+            rng.shuffle(ds_samples)
             split_idx = int(len(ds_samples) * 0.9)
             self.train_samples.extend(ds_samples[:split_idx])
             self.val_samples.extend(ds_samples[split_idx:])
+
+        # FIX: Sort by dataset_name to guarantee contiguous ranges for MultiDatasetBatchSampler
+        self.train_samples.sort(key=lambda x: x.get('dataset_name', 'unknown'))
+        self.val_samples.sort(key=lambda x: x.get('dataset_name', 'unknown'))
 
         self.logger.info(f"Train: {len(self.train_samples)}, Val: {len(self.val_samples)}")
         self.logger.info(f"Vocabulary size: {len(self.tokenizer)}")
@@ -231,7 +238,6 @@ class Trainer:
 
     def _compute_dataset_ranges(self, samples):
         """Compute per-dataset index ranges for temperature sampling."""
-        # FIX: Samples are now contiguous by dataset thanks to the stratified split
         self.dataset_ranges = {}
         current_idx = 0
         
@@ -288,8 +294,8 @@ class Trainer:
 
         self.logger.info(f"Encoder LR: {self.config.encoder_lr}, Decoder LR: {self.config.decoder_lr}")
 
-        # FIX: Dynamically calculate total training steps to prevent OneCycleLR crash
-        steps_per_epoch = len(self.train_loader) // self.config.accumulation_steps
+        # FIX: Use math.ceil to prevent undercounting steps and crashing OneCycleLR
+        steps_per_epoch = math.ceil(len(self.train_loader) / self.config.accumulation_steps)
         if steps_per_epoch == 0:
             steps_per_epoch = 1
         self.config.total_training_steps = steps_per_epoch * self.config.num_epochs
@@ -348,22 +354,30 @@ class Trainer:
                    hasattr(self.train_loader.batch_sampler, 'set_temperature'):
                     self.train_loader.batch_sampler.set_temperature(current_temp)
 
-                # Train step
-                loss = self._train_step(batch)
+                # FIX: Use engine.py train_step
+                loss = train_step(
+                    model=self.model,
+                    batch=batch,
+                    criterion=self.criterion,
+                    optimizer=self.optimizer,
+                    scaler=self.scaler,
+                    device=self.device,
+                    accumulation_steps=self.config.accumulation_steps,
+                    max_grad_norm=self.config.max_grad_norm
+                )
                 epoch_loss += loss
                 epoch_steps += 1
 
                 # Gradient accumulation
                 if (batch_idx + 1) % self.config.accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
+                    # FIX: Use engine.py optimizer_step
+                    optimizer_step(
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        scaler=self.scaler,
+                        scheduler=self.scheduler,
+                        max_grad_norm=self.config.max_grad_norm
                     )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
                     self.global_step += 1
 
                     # Logging every 10 optimizer steps
@@ -380,6 +394,17 @@ class Trainer:
                         )
                         self.step_start_time = time.time()
 
+            # FIX: Step optimizer for remaining accumulated gradients at the end of epoch
+            if epoch_steps % self.config.accumulation_steps != 0:
+                optimizer_step(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scaler=self.scaler,
+                    scheduler=self.scheduler,
+                    max_grad_norm=self.config.max_grad_norm
+                )
+                self.global_step += 1
+
             # End of epoch — always evaluate
             epoch_time = time.time() - self.epoch_start_time
             avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
@@ -391,10 +416,9 @@ class Trainer:
             )
 
             # Evaluate
-            metrics = self._evaluate()
+            metrics, is_best = self._evaluate(use_beam_search=False)
 
-            # FIX: Early Stopping Logic
-            is_best = metrics['exact_match'] > self.best_exp_rate
+            # Early Stopping Logic
             if is_best:
                 self.epochs_without_improvement = 0
             else:
@@ -419,78 +443,42 @@ class Trainer:
         self.logger.info(f"Best ExpRate: {self.best_exp_rate:.4f}")
         self.logger.info(f"Best Edit Distance: {self.best_edit_dist:.2f}")
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Single training step with AMP."""
-        images = batch['image'].to(self.device, non_blocking=True)
-        ids = batch['ids'].to(self.device, non_blocking=True)
-
-        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=torch.float16):
-            logits = self.model(images, ids)
-            loss = self.criterion(logits, ids)
-            loss = loss / self.config.accumulation_steps
-
-        self.scaler.scale(loss).backward()
-        return loss.item() * self.config.accumulation_steps
-
     # ----------------------------------------------------------------
     # Evaluation
     # ----------------------------------------------------------------
 
-    def _evaluate(self):
-        """Run evaluation on the validation set (greedy decode for speed)."""
-        self.logger.info("Running evaluation...")
-        self.model.eval()
-
-        all_preds = []
-        all_targets = []
-        total_loss = 0.0
-        num_batches = 0
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                if batch is None:
-                    continue
-
-                images = batch['image'].to(self.device)
-                ids = batch['ids'].to(self.device)
-
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=torch.float16):
-                    logits = self.model(images, ids)
-                    loss = self.criterion(logits, ids)
-                total_loss += loss.item()
-                num_batches += 1
-
-                for i in range(images.size(0)):
-                    pred_tokens = greedy_decode(
-                        self.model, images[i:i+1],
-                        self.tokenizer.sos_id, self.tokenizer.eos_id,
-                        max_len=self.config.max_seq_len,
-                        device=self.device,
-                    )
-                    pred_latex = self.tokenizer.decode(pred_tokens, skip_special=True)
-                    gt_ids = ids[i].cpu().tolist()
-                    gt_latex = self.tokenizer.decode(gt_ids, skip_special=True)
-
-                    all_preds.append(pred_latex)
-                    all_targets.append(gt_latex)
-
-        metrics = compute_batch_metrics(all_preds, all_targets)
-        avg_loss = total_loss / max(num_batches, 1)
+    def _evaluate(self, use_beam_search: bool = False, max_samples: int = None) -> Tuple[Dict[str, float], bool]:
+        """Run evaluation on the validation set using engine.py."""
+        self.logger.info(f"Running evaluation (Beam Search: {use_beam_search})...")
+        
+        # FIX: Use the fully batched evaluate_full from engine.py
+        metrics = evaluate_full(
+            model=self.model,
+            dataloader=self.val_loader,
+            criterion=self.criterion,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            use_beam_search=use_beam_search,
+            beam_width=self.config.beam_width,
+            max_len=self.config.max_seq_len,
+            length_penalty=self.config.length_penalty,
+            max_samples=max_samples
+        )
 
         self.logger.info(
-            f"  EVAL | Loss: {avg_loss:.4f} | "
+            f"  EVAL | Loss: {metrics.get('val_loss', 0.0):.4f} | "
             f"ExpRate: {metrics['exact_match']:.4f} | "
             f"EditDist: {metrics['edit_dist']:.2f} | "
             f"SER: {metrics['ser']:.4f} | "
             f"Leq1: {metrics['leq1']:.4f}"
         )
 
-        # Track best model
-        is_best = metrics['exact_match'] > self.best_exp_rate
+        # FIX: Early stopping on Edit Distance (lower is better) instead of Exact Match
+        is_best = metrics['edit_dist'] < self.best_edit_dist
         if is_best:
             self.best_exp_rate = metrics['exact_match']
             self.best_edit_dist = metrics['edit_dist']
-            self.logger.info(f"  *** New best ExpRate: {self.best_exp_rate:.4f} ***")
+            self.logger.info(f"  *** New best EditDist: {self.best_edit_dist:.2f} (ExpRate: {self.best_exp_rate:.4f}) ***")
 
             best_path = os.path.join(self.config.checkpoint_dir, "best.pt")
             save_checkpoint(
@@ -503,59 +491,7 @@ class Trainer:
             # Push best to HuggingFace model repo
             push_checkpoint_to_hf(best_path, self.config, self.current_epoch, is_best=True)
 
-        self.model.train()
-        return metrics
-
-    def evaluate_with_beam_search(self, max_samples: int = 200):
-        """Full evaluation with beam search (slower but more accurate)."""
-        self.logger.info(f"Running beam search evaluation (max {max_samples} samples)...")
-        self.model.eval()
-
-        all_preds = []
-        all_targets = []
-        count = 0
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                if batch is None:
-                    continue
-
-                images = batch['image'].to(self.device)
-                ids = batch['ids'].to(self.device)
-
-                for i in range(images.size(0)):
-                    if count >= max_samples:
-                        break
-                    pred_tokens = beam_search(
-                        self.model, images[i:i+1],
-                        self.tokenizer.sos_id, self.tokenizer.eos_id, self.tokenizer.pad_id,
-                        beam_width=self.config.beam_width,
-                        max_len=self.config.max_seq_len,
-                        length_penalty=self.config.length_penalty,
-                        device=self.device,
-                    )
-                    pred_latex = self.tokenizer.decode(pred_tokens, skip_special=True)
-                    gt_ids = ids[i].cpu().tolist()
-                    gt_latex = self.tokenizer.decode(gt_ids, skip_special=True)
-
-                    all_preds.append(pred_latex)
-                    all_targets.append(gt_latex)
-                    count += 1
-
-                if count >= max_samples:
-                    break
-
-        metrics = compute_batch_metrics(all_preds, all_targets)
-        self.logger.info(
-            f"BEAM SEARCH EVAL | "
-            f"ExpRate: {metrics['exact_match']:.4f} | "
-            f"EditDist: {metrics['edit_dist']:.2f} | "
-            f"SER: {metrics['ser']:.4f} | "
-            f"Leq1: {metrics['leq1']:.4f}"
-        )
-
-        self.model.train()
-        return metrics
+        return metrics, is_best
 
     # ----------------------------------------------------------------
     # Checkpointing
@@ -607,7 +543,7 @@ class Trainer:
         self.best_edit_dist = metrics.get('edit_dist', float('inf'))
         self.logger.info(
             f"Resumed: epoch={epoch}, step={step}, "
-            f"best_exp_rate={self.best_exp_rate:.4f}"
+            f"best_edit_dist={self.best_edit_dist:.2f}"
         )
         return True
 
@@ -645,7 +581,9 @@ class Trainer:
             self._auto_resume()
 
         self.train()
-        self.evaluate_with_beam_search(max_samples=500)
+        
+        # Final evaluation with beam search
+        self._evaluate(use_beam_search=True, max_samples=500)
 
         self.logger.info("=" * 70)
         self.logger.info("Pipeline complete!")

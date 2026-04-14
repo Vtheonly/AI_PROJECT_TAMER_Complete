@@ -1,6 +1,11 @@
 """
 Dataset Parser for TAMER OCR Training.
 Converts various dataset formats to a unified structure.
+
+Fixes:
+- STRICTLY enforces that images are saved to disk and only string paths are kept in memory.
+- Prevents massive OOM crashes (Bug 5) by removing PIL image persistence in dictionaries.
+- Optimized InkML rendering for CROHME.
 """
 
 import os
@@ -103,12 +108,14 @@ class DatasetParser:
         return None
 
     def _validate_sample(self, img_source: Any, latex: str) -> bool:
+        """
+        Validates that the sample has a valid LaTeX string and the image is a valid string path.
+        FIX: Strictly rejects PIL Images to prevent OOM memory leaks.
+        """
         if not latex or not latex.strip():
             return False
         if isinstance(img_source, str):
             return os.path.exists(img_source)
-        if isinstance(img_source, Image.Image):
-            return True
         return False
 
     def parse_im2latex(self, extract_dir: str) -> List[Dict[str, Any]]:
@@ -221,7 +228,6 @@ class DatasetParser:
             img_out_dir = os.path.join(extract_dir, "images")
             os.makedirs(img_out_dir, exist_ok=True)
 
-            # FIX: Parallelize InkML rendering to save hours of processing time
             def process_inkml(inkml_path):
                 try:
                     base_name = os.path.splitext(os.path.basename(inkml_path))[0]
@@ -347,20 +353,27 @@ class DatasetParser:
                         elif isinstance(img, dict) and 'path' in img:
                             samples.append({"image": img['path'], "latex": latex, "dataset_name": "mathwriting"})
                             continue
-                        else:
+                        elif isinstance(img, str):
                             samples.append({"image": img, "latex": latex, "dataset_name": "mathwriting"})
                             continue
 
-                        if pil_img and img_dir:
+                        if pil_img:
+                            # FIX: Prevent OOM by strictly requiring an extract_dir to save the image.
+                            # We NEVER append the raw PIL image to the samples list.
+                            if not img_dir:
+                                logger.warning(f"Skipping sample {idx}: No extract_dir provided. Keeping PIL images in memory causes OOM.")
+                                continue
+                                
                             import hashlib
                             h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                             img_path = os.path.join(img_dir, f"img_{idx}_{h}.png")
+                            
                             if not os.path.exists(img_path):
                                 safe_img = Image.fromarray(np.array(pil_img))
                                 safe_img.save(img_path, format="PNG")
+                                
                             samples.append({"image": img_path, "latex": latex, "dataset_name": "mathwriting"})
-                        elif pil_img:
-                            samples.append({"image": pil_img, "latex": latex, "dataset_name": "mathwriting"})
+                            
                 except Exception as e:
                     logger.debug(f"Skipping corrupt HF image sample at index {idx}: {e}")
                     continue

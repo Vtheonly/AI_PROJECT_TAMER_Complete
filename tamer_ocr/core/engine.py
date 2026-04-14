@@ -23,7 +23,7 @@ def train_step(
     batch: Dict[str, Any],
     criterion: LabelSmoothedCELoss,
     optimizer: torch.optim.Optimizer,
-    scaler: "torch.cuda.amp.GradScaler",
+    scaler: "torch.amp.GradScaler",
     device: torch.device,
     accumulation_steps: int = 4,
     max_grad_norm: float = 1.0,
@@ -36,7 +36,7 @@ def train_step(
         batch: Dict with 'image' and 'ids' tensors
         criterion: Loss function
         optimizer: Optimizer
-        scaler: AMP GradScaler
+        scaler: AMP GradScaler (PyTorch 2.0+)
         device: torch device
         accumulation_steps: Number of gradient accumulation steps
         max_grad_norm: Max gradient norm for clipping
@@ -64,7 +64,7 @@ def train_step(
 def optimizer_step(
     model: TAMERModel,
     optimizer: torch.optim.Optimizer,
-    scaler: "torch.cuda.amp.GradScaler",
+    scaler: "torch.amp.GradScaler",
     scheduler=None,
     max_grad_norm: float = 1.0,
 ):
@@ -138,7 +138,7 @@ def eval_step(
                 pred_latex = tokenizer.decode(pred_tokens, skip_special=True)
                 preds.append(pred_latex)
         else:
-            # FIX: Use the new fully batched greedy_decode for massive speedup
+            # Fully batched greedy_decode for massive speedup
             pred_tokens_batch = greedy_decode(
                 model, images,
                 tokenizer.sos_id, tokenizer.eos_id,
@@ -198,6 +198,15 @@ def evaluate_full(
             if batch is None:
                 continue
 
+            # FIX: Optimize evaluation by slicing the batch BEFORE the forward pass
+            # if we are about to exceed max_samples. Saves GPU computation.
+            batch_size = batch['image'].size(0)
+            if max_samples and sample_count + batch_size > max_samples:
+                limit = max_samples - sample_count
+                batch['image'] = batch['image'][:limit]
+                batch['ids'] = batch['ids'][:limit]
+                batch_size = limit
+
             loss, preds, gts = eval_step(
                 model, batch, criterion, tokenizer, device,
                 use_beam_search=use_beam_search,
@@ -209,12 +218,9 @@ def evaluate_full(
             num_batches += 1
             all_preds.extend(preds)
             all_targets.extend(gts)
-            sample_count += len(preds)
+            sample_count += batch_size
 
             if max_samples and sample_count >= max_samples:
-                # FIX: Truncate to exact max_samples if we overshot
-                all_preds = all_preds[:max_samples]
-                all_targets = all_targets[:max_samples]
                 break
 
     metrics = compute_batch_metrics(all_preds, all_targets)
