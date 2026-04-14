@@ -9,7 +9,6 @@ class Config:
     output_dir: str = "./outputs"
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
-    drive_backup_dir: str = ""  # Google Drive path for backup (e.g., "/content/drive/MyDrive/tamer_checkpoints")
 
     # Dataset Configuration
     datasets: List[str] = field(default_factory=lambda: [])
@@ -56,14 +55,22 @@ class Config:
     beam_width: int = 5
     length_penalty: float = 0.6  # Penalize short predictions
 
-    # Checkpointing — step-based for Colab session hopping
-    checkpoint_every_steps: int = 1000
+    # Checkpointing — epoch-based, save every N epochs, auto-resume from latest
+    checkpoint_every_epochs: int = 3
     keep_last_n_checkpoints: int = 3
     eval_every: int = 1
 
-    # HuggingFace
+    # HuggingFace — Model Checkpoints
     hf_repo_id: str = ""
     hf_token: str = ""
+
+    # HuggingFace — Processed Dataset Repository
+    hf_dataset_repo_id: str = ""   # e.g. "username/tamer-preprocessed"
+    # If empty, defaults to "{hf_username}/tamer-preprocessed"
+
+    # Kaggle
+    kaggle_username: str = "merselfares"
+    kaggle_key: str = ""
 
     # 72-Hour Schedule (step counts are approximate)
     phase1_steps: int = 0        # Phase 1: Printed data only (Im2LaTeX + MathWriting)
@@ -73,5 +80,3 @@ class Config:
     def __post_init__(self):
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:
             os.makedirs(path, exist_ok=True)
-        if self.drive_backup_dir:
-            os.makedirs(self.drive_backup_dir, exist_ok=True)

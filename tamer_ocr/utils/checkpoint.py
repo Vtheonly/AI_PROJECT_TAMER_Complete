@@ -1,20 +1,17 @@
 """
-Checkpoint utilities for TAMER training.
+Checkpoint utilities for TAMER training v2.1.
 
-Key improvements:
-- Saves scaler_state_dict (for AMP)
-- Saves scheduler_state_dict (for OneCycleLR)
-- Saves step count (for step-based training)
-- Google Drive backup support for Colab
-- Keeps last N checkpoints to avoid filling disk
+- Saves full training state: model, optimizer, scheduler, scaler, epoch, step
+- Pushes checkpoints to Hugging Face Hub (NOT Google Drive)
+- Finds latest checkpoint for auto-resume
+- Keeps last N local checkpoints to avoid filling disk
 """
 
 import os
 import glob
-import shutil
 import torch
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("TAMER.Checkpoint")
 
@@ -37,15 +34,15 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'metrics': metrics,
     }
-    
+
     # Save scaler state (critical for AMP)
     if scaler is not None:
         checkpoint['scaler_state_dict'] = scaler.state_dict()
-    
+
     # Save scheduler state
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-    
+
     try:
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved: {path} (epoch={epoch}, step={step})")
@@ -60,94 +57,109 @@ def load_checkpoint(
     scheduler=None,
     scaler=None,
     device: str = 'cpu',
-) -> tuple:
+) -> Tuple[int, int, Dict[str, Any]]:
     """
     Load a training checkpoint.
-    
+
     Returns:
         (epoch, step, metrics) tuple
     """
     if not os.path.exists(path):
         logger.warning(f"No checkpoint found at {path}")
         return 0, 0, {}
-    
+
     try:
         ckpt = torch.load(path, map_location=device, weights_only=False)
-        
+
         model.load_state_dict(ckpt['model_state_dict'])
-        
+
         if optimizer and 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        
+
         if scheduler and 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        
+
         if scaler and 'scaler_state_dict' in ckpt:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
-        
+
         epoch = ckpt.get('epoch', 0)
         step = ckpt.get('step', 0)
         metrics = ckpt.get('metrics', {})
-        
+
         logger.info(f"Resumed from checkpoint {path} (epoch={epoch}, step={step})")
         return epoch, step, metrics
-    
+
     except Exception as e:
         logger.error(f"Failed to load checkpoint: {e}")
         return 0, 0, {}
 
 
-def backup_to_drive(checkpoint_path: str, drive_dir: str, keep_last_n: int = 3):
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     """
-    Copy checkpoint to Google Drive for Colab session hopping.
-    Keeps only the last N checkpoints to avoid filling Drive.
+    Find the most recent checkpoint in a directory.
+
+    Looks for epoch_*.pt files, sorted by modification time.
+    Also checks for best.pt.
+
+    Returns:
+        Path to the latest checkpoint, or None if no checkpoints found
     """
-    if not drive_dir or not os.path.exists(checkpoint_path):
-        return
-    
-    try:
-        os.makedirs(drive_dir, exist_ok=True)
-        
-        # Copy the checkpoint
-        dest = os.path.join(drive_dir, os.path.basename(checkpoint_path))
-        shutil.copy2(checkpoint_path, dest)
-        logger.info(f"Backup saved to Drive: {dest}")
-        
-        # Clean up old checkpoints
-        checkpoints = sorted(
-            glob.glob(os.path.join(drive_dir, "*.pt")),
-            key=os.path.getmtime,
-            reverse=True
-        )
-        
-        for old_ckpt in checkpoints[keep_last_n:]:
-            os.remove(old_ckpt)
-            logger.info(f"Removed old backup: {old_ckpt}")
-    
-    except Exception as e:
-        logger.error(f"Drive backup failed: {e}")
+    if not os.path.exists(checkpoint_dir):
+        return None
+
+    # Look for epoch-based checkpoints
+    ckpt_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pt"))
+
+    if not ckpt_files:
+        # Fallback: look for best.pt
+        best_path = os.path.join(checkpoint_dir, "best.pt")
+        if os.path.exists(best_path):
+            return best_path
+        return None
+
+    # Sort by modification time (newest first)
+    ckpt_files.sort(key=os.path.getmtime, reverse=True)
+    return ckpt_files[0]
 
 
-def push_to_huggingface(checkpoint_path: str, config, step: int, is_best: bool = False):
-    """Push a checkpoint to Hugging Face Hub."""
+def cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int = 3):
+    """
+    Keep only the last N epoch checkpoints (best.pt is always kept).
+    """
+    ckpt_files = sorted(
+        glob.glob(os.path.join(checkpoint_dir, "epoch_*.pt")),
+        key=os.path.getmtime,
+    )
+    if len(ckpt_files) > keep_last_n:
+        for old_ckpt in ckpt_files[:-keep_last_n]:
+            try:
+                os.remove(old_ckpt)
+                logger.info(f"Removed old checkpoint: {old_ckpt}")
+            except OSError:
+                pass
+
+
+def push_checkpoint_to_hf(checkpoint_path: str, config, epoch: int, is_best: bool = False):
+    """Push a checkpoint to Hugging Face Hub (model repo)."""
     hf_token = getattr(config, 'hf_token', '') or os.getenv('HF_TOKEN', '')
     hf_repo = getattr(config, 'hf_repo_id', '')
-    
+
     if not hf_token or not hf_repo:
+        logger.info("HF token or repo not configured — skipping checkpoint push")
         return
-    
+
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=hf_token)
-        
+
         # Auto-resolve username
         if '/' not in hf_repo:
             username = api.whoami()['name']
             hf_repo = f"{username}/{hf_repo}"
-        
+
         api.create_repo(repo_id=hf_repo, exist_ok=True, repo_type="model", private=True)
-        
-        remote_name = "best.pt" if is_best else f"checkpoint_step_{step}.pt"
+
+        remote_name = "best.pt" if is_best else f"checkpoint_epoch_{epoch}.pt"
         api.upload_file(
             path_or_fileobj=checkpoint_path,
             path_in_repo=remote_name,

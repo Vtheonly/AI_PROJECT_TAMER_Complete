@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-TAMER OCR Training Entry Point.
+TAMER OCR v2.1 Training Entry Point.
 
 Usage:
     python train.py                           # Full pipeline with defaults
-    python train.py --resume checkpoint.pt    # Resume from checkpoint
+    python train.py --resume checkpoint.pt    # Resume from specific checkpoint
     python train.py --eval-only best.pt       # Run evaluation only
     python train.py --epochs 50               # Override number of epochs
     python train.py --encoder-lr 2e-5         # Override encoder learning rate
@@ -17,36 +17,31 @@ import torch
 
 from tamer_ocr.config import Config
 from tamer_ocr.core.trainer import Trainer
-from tamer_ocr.core.engine import evaluate_full
-from tamer_ocr.core.losses import LabelSmoothedCELoss
-from tamer_ocr.models.tamer import TAMERModel
-from tamer_ocr.data.tokenizer import LaTeXTokenizer
-from tamer_ocr.utils.checkpoint import load_checkpoint
+from tamer_ocr.utils.checkpoint import find_latest_checkpoint
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TAMER OCR Training")
-    parser.add_argument('--data-dir', type=str, default=None, help='Data directory')
-    parser.add_argument('--output-dir', type=str, default=None, help='Output directory')
-    parser.add_argument('--checkpoint-dir', type=str, default=None, help='Checkpoint directory')
+    parser = argparse.ArgumentParser(description="TAMER OCR v2.1 Training")
+    parser.add_argument('--data-dir', type=str, default=None)
+    parser.add_argument('--output-dir', type=str, default=None)
+    parser.add_argument('--checkpoint-dir', type=str, default=None)
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--eval-only', type=str, default=None, help='Path to checkpoint for eval-only mode')
-    parser.add_argument('--epochs', type=int, default=None, help='Override num_epochs')
-    parser.add_argument('--batch-size', type=int, default=None, help='Override batch_size')
-    parser.add_argument('--encoder-lr', type=float, default=None, help='Override encoder learning rate')
-    parser.add_argument('--decoder-lr', type=float, default=None, help='Override decoder learning rate')
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--encoder-lr', type=float, default=None)
+    parser.add_argument('--decoder-lr', type=float, default=None)
     parser.add_argument('--beam-eval', action='store_true', help='Use beam search for eval-only mode')
-    parser.add_argument('--drive-backup', type=str, default=None, help='Google Drive backup directory')
-    parser.add_argument('--hf-repo', type=str, default=None, help='HuggingFace repo ID')
-    parser.add_argument('--hf-token', type=str, default=None, help='HuggingFace token')
-    parser.add_argument('--force-refresh', action='store_true', help='Force data refresh')
+    parser.add_argument('--hf-repo', type=str, default=None, help='HuggingFace MODEL repo ID')
+    parser.add_argument('--hf-dataset-repo', type=str, default=None, help='HuggingFace DATASET repo ID')
+    parser.add_argument('--hf-token', type=str, default=None)
+    parser.add_argument('--force-refresh', action='store_true', help='Force data re-download')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Build config with overrides
     config = Config()
 
     if args.data_dir:
@@ -63,22 +58,21 @@ def main():
         config.encoder_lr = args.encoder_lr
     if args.decoder_lr:
         config.decoder_lr = args.decoder_lr
-    if args.drive_backup:
-        config.drive_backup_dir = args.drive_backup
     if args.hf_repo:
         config.hf_repo_id = args.hf_repo
+    if args.hf_dataset_repo:
+        config.hf_dataset_repo_id = args.hf_dataset_repo
     if args.hf_token:
         config.hf_token = args.hf_token
 
     print("=" * 70)
-    print("TAMER OCR: Handwritten Mathematical Expression Recognition")
+    print("TAMER OCR v2.1: Handwritten Mathematical Expression Recognition")
     print("Swin-Base Encoder + Standard Transformer Decoder")
     print("=" * 70)
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Config: {config}")
     print("=" * 70)
 
     # Eval-only mode
@@ -89,7 +83,8 @@ def main():
             sys.exit(1)
 
         trainer = Trainer(config)
-        trainer.prepare_data(force_refresh=args.force_refresh)
+        trainer.preprocess_data()
+        trainer.create_dataloaders()
         trainer.build_model()
         trainer.resume_from_checkpoint(eval_checkpoint)
 
@@ -103,7 +98,7 @@ def main():
             print(f"  {k}: {v:.4f}")
         return
 
-    # Full training pipeline
+    # Full training pipeline (auto-resumes from latest checkpoint)
     trainer = Trainer(config)
     trainer.run(resume_from=args.resume)
 

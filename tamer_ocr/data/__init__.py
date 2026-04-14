@@ -18,7 +18,7 @@ def __getattr__(name):
         'TemperatureSampler': '.sampler',
         'MultiDatasetBatchSampler': '.sampler',
         'get_temperature_for_step': '.sampler',
-        'DataManager': '.data_manager',
+        'DatasetPreprocessor': '.preprocessor',
         'create_data_manager': '.data_manager',
         'DatasetParser': '.parser',
         'create_parser': '.parser',
