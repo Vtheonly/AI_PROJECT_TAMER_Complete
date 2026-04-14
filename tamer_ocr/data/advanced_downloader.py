@@ -138,7 +138,7 @@ class AdvDownloader:
             from datasets import load_dataset
             from huggingface_hub import login
             
-            # Login if token provided (add_to_git_credential=False prevents the warning)
+            # Login if token provided (add_to_git_credential=False prevents the git warning)
             if self.hf_token:
                 try:
                     login(token=self.hf_token, add_to_git_credential=False)
@@ -146,7 +146,7 @@ class AdvDownloader:
                 except Exception as e:
                     logger.warning(f"Hugging Face login failed: {e}")
             
-            logger.info(f"Loading Hugging Face dataset: {repo_id} ({split})")
+            print(f"\n[HuggingFace] Downloading dataset: {repo_id}...")
             dataset = load_dataset(repo_id, split=split)
             logger.info(f"Successfully loaded HF dataset: {repo_id} ({len(dataset)} samples)")
             return dataset
@@ -194,30 +194,20 @@ class AdvDownloader:
         except Exception as e:
             logger.warning(f"Could not write kaggle.json: {e}")
 
-        logger.info(f"Downloading Kaggle dataset: {dataset_identifier} using CLI...")
-        
         try:
             os.makedirs(extract_dir, exist_ok=True)
             
-            # Subprocess calls the CLI
+            # CRITICAL FIX: We DO NOT use capture_output=True anymore.
+            # This allows the Kaggle progress bar to print directly to the notebook!
+            print(f"\n[Kaggle] Starting download for: {dataset_identifier}...")
             result = subprocess.run(
-                ["kaggle", "datasets", "download", "-d", dataset_identifier, "-p", extract_dir, "--unzip"],
-                capture_output=True, text=True
+                ["kaggle", "datasets", "download", "-d", dataset_identifier, "-p", extract_dir, "--unzip"]
             )
             
             if result.returncode != 0:
-                # Kaggle often prints errors to stdout instead of stderr
-                error_output = result.stderr.strip() or result.stdout.strip()
-                logger.error(f"Kaggle CLI failed.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
-                
-                if "403" in error_output:
-                    logger.error("🚨 403 FORBIDDEN: Your Kaggle API key is invalid, expired, OR the dataset is private and you lack access.")
-                elif "401" in error_output:
-                    logger.error("🚨 401 UNAUTHORIZED: Your Kaggle API key is incorrect.")
-                elif "404" in error_output:
-                    logger.error(f"🚨 404 NOT FOUND: The dataset '{dataset_identifier}' does not exist or was deleted.")
-                
-                raise DownloadError(f"Kaggle download failed: {error_output}")
+                logger.error(f"Kaggle CLI failed with exit code {result.returncode}.")
+                logger.error("Check the output above. You might have a 403 Forbidden (bad API key) or 404 Not Found.")
+                raise DownloadError(f"Kaggle download failed: exit code {result.returncode}")
                 
             logger.info(f"Kaggle dataset downloaded and extracted to {extract_dir}")
             
@@ -240,12 +230,12 @@ class AdvDownloader:
             logger.info(f"Zenodo dataset already extracted at {extract_dir}")
             return
             
-        logger.info(f"Downloading Zenodo ZIP from {url}...")
+        print(f"\n[Zenodo/URL] Downloading ZIP from {url}...")
         
         try:
             self._download_large_file_with_requests(url, zip_path, verify_ssl=verify_ssl)
             
-            logger.info("Extracting ZIP...")
+            print(f"[Zenodo/URL] Download complete. Extracting ZIP to {extract_dir}...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
             
@@ -270,31 +260,23 @@ class AdvDownloader:
             return
         
         if not shutil.which("git"):
-            error_msg = "Git is not installed or not found in PATH."
-            logger.error(error_msg)
-            raise DownloadError(error_msg)
+            raise DownloadError("Git is not installed or not found in PATH.")
             
-        logger.info(f"Cloning GitHub repository from {repo_url} (shallow clone)...")
+        print(f"\n[GitHub] Cloning repository from {repo_url}...")
         
         try:
             os.makedirs(extract_dir, exist_ok=True)
             result = subprocess.run(
                 ["git", "clone", "--depth", "1", repo_url, extract_dir],
-                capture_output=True,
-                text=True,
                 timeout=3600
             )
             
             if result.returncode == 0:
                 logger.info(f"Clone complete: {extract_dir}")
             else:
-                error_msg = f"git clone failed with exit code {result.returncode}\nstderr: {result.stderr}"
-                logger.error(error_msg)
-                raise DownloadError(error_msg)
+                raise DownloadError(f"git clone failed with exit code {result.returncode}")
         except subprocess.TimeoutExpired:
-            error_msg = "git clone timed out after 1 hour."
-            logger.error(error_msg)
-            raise DownloadError(error_msg)
+            raise DownloadError("git clone timed out after 1 hour.")
         except Exception as e:
             logger.error(f"Failed to clone repository: {e}")
             raise
@@ -338,14 +320,12 @@ class AdvDownloader:
                         f.write(chunk)
                         downloaded += len(chunk)
                         
+                        # Show progress in notebook
                         if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
                             progress = (downloaded / max(1, content_length)) * 100 if content_length > 0 else 0
-                            logger.info(
-                                f"  Downloaded: {downloaded // (1024*1024)}MB / "
-                                f"{content_length // (1024*1024)}MB ({progress:.1f}%)"
-                            )
+                            print(f"  Downloaded: {downloaded // (1024*1024)}MB / {content_length // (1024*1024)}MB ({progress:.1f}%)")
             
-            logger.info(f"Download complete: {dest_path} ({downloaded // (1024*1024)}MB)")
+            print(f"Download strictly completed: {dest_path}")
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Download failed: {e}")
@@ -371,8 +351,6 @@ class AdvDownloader:
         extract_dir = Path(extract_to)
         extract_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Extracting {path.name} to {extract_dir}")
-        
         try:
             if archive_path.endswith('.zip'):
                 with zipfile.ZipFile(archive_path, 'r') as zf:
@@ -384,27 +362,11 @@ class AdvDownloader:
                 with tarfile.open(archive_path, 'r') as tf:
                     tf.extractall(extract_dir)
             else:
-                logger.warning(f"Unknown archive format: {archive_path}")
                 return False
             return True
         except Exception as e:
             logger.error(f"Extraction failed: {e}")
             return False
-
-    def check_disk_space(self, required_bytes: int) -> bool:
-        """Check if there's enough disk space for a download."""
-        import shutil
-        data_dir = getattr(self.config, 'data_dir', './data')
-        available = shutil.disk_usage(data_dir).free
-        if available < required_bytes * 1.1:
-            logger.error(
-                f"Insufficient disk space! "
-                f"Required: {required_bytes // (1024*1024)}MB, "
-                f"Available: {available // (1024*1024)}MB"
-            )
-            return False
-        return True
-
 
 def create_downloader(config) -> AdvDownloader:
     """Factory function to create an AdvDownloader instance."""
