@@ -40,8 +40,25 @@ from ..data.sampler import (
     MultiDatasetBatchSampler,
     get_temperature_for_step,
 )
-from ..data.preprocessor import DatasetPreprocessor
-from ..data.augmentation import get_train_augmentation, get_val_augmentation
+
+# CORRECT
+from .preprocessor import DatasetPreprocessor
+
+
+# Replace the augmentation import with inline definitions:
+import torchvision.transforms as T
+
+def get_train_augmentation():
+    return T.Compose([
+        T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.95, 1.05)),
+        T.ToTensor(),
+    ])
+
+def get_val_augmentation():
+    return T.Compose([
+        T.ToTensor(),
+    ])
+
 from .losses import LabelSmoothedCELoss
 from .inference import beam_search, greedy_decode
 from ..utils.checkpoint import (
