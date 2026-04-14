@@ -1,15 +1,4 @@
 
-fix ALL of this one by one file by file one file at a time
-give me a full single at a time and full single at a time only, nothing more
-full single at a time only please, make no mistakes in it
-give me only full single at a time, make no mistakes please because you omit and removed a lot and a lot of lines
-just give me a full single at a time give me one file at a time
-Fix all of this one by one, file by file, one file at a time.
-Give me a full single file at a time, and only one file at a time, nothing more.
-One full file at a time only, please, and make no mistakes in it.
-Give me only one full file at a time. Make no mistakes, because you omitted and removed a lot of lines before.
-Just give me one full file at a time. One file at a time
-
 
 
 
