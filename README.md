@@ -240,3 +240,6 @@ To be fair: the core architecture decisions are solid. Removing the TAM tree str
 You'll hit the OneCycleLR crash somewhere around epoch 1–3 (when optimizer steps exceed 50,000). Before that, you'll be training with broken temperature sampling. After fixing those two, you'll discover evaluation takes 3x longer than training per epoch. None of this is unfixable — but as committed right now, you will not get a trained model out the other end.
 
 Fix priority: **1 → 2 → 5 → 3 → 7**, in that order.
+
+
+BIGG CHECK POINT IMPTOTANT 
