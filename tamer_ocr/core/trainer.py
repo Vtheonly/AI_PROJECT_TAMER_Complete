@@ -88,7 +88,9 @@ class Trainer:
         self.logger.info(f"Device: {self.device}")
         if torch.cuda.is_available():
             self.logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            self.logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            props = torch.cuda.get_device_properties(0)
+            vram_gb = getattr(props, 'total_memory', 0) / 1e9
+            self.logger.info(f"VRAM: {vram_gb:.1f} GB")
 
         # Tokenizer — built during preprocessing
         self.tokenizer = LaTeXTokenizer()
