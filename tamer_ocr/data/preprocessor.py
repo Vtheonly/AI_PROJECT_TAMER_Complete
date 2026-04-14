@@ -1,12 +1,17 @@
 """
 Dataset Preprocessor for TAMER OCR v2.2.
 
-Implements the STRICT pipeline:
-  1. Download all datasets from source (HF, Kaggle, URL)
-  2. Preprocess ENTIRE dataset (normalize LaTeX, filter, render InkML via Parser)
-  3. Verify clean datasets and build tokenizer
-  4. Archive processed data (ZIP) and Push to HuggingFace
-  5. Recovery: Can pull the ZIP from HF to skip Step 1-3 on fresh runs.
+STRICT WORKFLOW:
+  1. Recovery: Checks HuggingFace for 'processed_images.zip'.
+     - If found: Downloads, extracts, and loads metadata. (Saves hours)
+  2. Processing (if no cloud ZIP):
+     - Downloads raw datasets (Kaggle, Zenodo, HF).
+     - Renders InkML to PNG images.
+     - Saves all images into 'data/processed/images/'.
+     - Generates JSONL metadata.
+  3. Archiving:
+     - Zips the entire 'processed' folder (images + metadata).
+     - Pushes the ZIP to HuggingFace for future session recovery.
 """
 
 import os
@@ -28,7 +33,7 @@ from .validator import validate_samples
 logger = logging.getLogger("TAMER.Preprocessor")
 
 def _get_memory_usage_mb() -> float:
-    """Safe memory check handling missing psutil."""
+    """Safe memory check to prevent OOM during large image processing."""
     try:
         import psutil
         process = psutil.Process(os.getpid())
@@ -49,8 +54,11 @@ class DatasetPreprocessor:
         self.downloader = AdvDownloader(config)
         self.tokenizer = LaTeXTokenizer()
 
+        # Define paths for the processed output
         self.processed_dir = os.path.join(self.data_dir, "processed")
         self.image_dir = os.path.join(self.processed_dir, "images")
+        
+        # Ensure directories exist
         os.makedirs(self.image_dir, exist_ok=True)
 
         self.manifest_path = os.path.join(self.processed_dir, "manifest.json")
@@ -75,72 +83,78 @@ class DatasetPreprocessor:
         with open(self.manifest_path, 'w') as f:
             json.dump(self.manifest, f, indent=2, ensure_ascii=False)
 
-    # --- CLOUD SYNC LOGIC ---
+    # ============================================================
+    # CLOUD SYNC: ZIP & HF STORAGE
+    # ============================================================
 
     def pull_from_huggingface(self) -> bool:
-        """Attempts to download and extract the processed archive to save time."""
+        """Downloads the image archive from HF to skip all processing steps."""
         hf_repo = self.config.hf_dataset_repo_id
-        if not hf_repo or not self.config.hf_token:
+        hf_token = self.config.hf_token
+
+        if not hf_repo or not hf_token:
             return False
 
-        logger.info(f"Checking Hugging Face for pre-processed archive: {hf_repo}")
+        logger.info(f"🔍 Checking Hugging Face for processed image archive: {hf_repo}")
         try:
             from huggingface_hub import hf_hub_download
+            
+            # Download the ZIP
             zip_path = hf_hub_download(
                 repo_id=hf_repo,
-                filename="processed_data.zip",
+                filename="processed_images.zip",
                 repo_type="dataset",
-                token=self.config.hf_token
+                token=hf_token
             )
             
-            logger.info("Cloud archive found. Extracting...")
-            # We extract to the data_dir. The zip contains the 'processed' folder structure.
+            logger.info("📦 Archive found! Extracting images and metadata...")
+            # Extract to data_dir so that the 'processed' folder is recreated
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(self.data_dir)
             
-            # Re-initialize state from extracted files
+            # Load the extracted tokenizer
             tok_path = os.path.join(self.processed_dir, "tokenizer.json")
             if os.path.exists(tok_path):
                 self.tokenizer.load(tok_path)
             
             self.manifest = self._load_manifest()
-            logger.info("Cloud recovery complete. Ready for training.")
+            logger.info("✅ Recovery complete. All images and metadata restored.")
             return True
         except Exception as e:
-            logger.info(f"Cloud archive not available ({e}). Proceeding with fresh processing.")
+            logger.info(f"ℹ️ Cloud archive not available ({e}). Fresh processing required.")
             return False
 
     def push_to_huggingface(self, all_processed: Dict[str, List[Dict]]) -> bool:
-        """Packs the processed images and metadata into a ZIP and pushes to HF."""
+        """Zips the processed/images folder and metadata, then pushes to HF."""
         hf_token = self.config.hf_token
         hf_repo = self.config.hf_dataset_repo_id
 
         if not hf_token or not hf_repo:
-            logger.warning("No HF credentials. Data will only be saved locally.")
+            logger.warning("⚠️ HF credentials missing. Skipping cloud archive push.")
             return False
 
-        # 1. Create the ZIP archive
-        zip_filename = os.path.join(self.data_dir, "processed_data.zip")
-        logger.info(f"Archiving processed data to {zip_filename}...")
+        # 1. Create the ZIP archive of the entire processed folder
+        zip_filename = os.path.join(self.data_dir, "processed_images.zip")
+        logger.info(f"🤐 Zipping processed images and metadata into {zip_filename}...")
         
         with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Add images, jsonl files, tokenizer, and manifest
             for root, _, files in os.walk(self.processed_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
+                    # Maintain the folder structure relative to the data_dir
                     arcname = os.path.relpath(file_path, self.data_dir)
                     zipf.write(file_path, arcname)
 
-        # 2. Upload to HF
+        # 2. Upload the ZIP to HF
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
             api.create_repo(repo_id=hf_repo, exist_ok=True, repo_type="dataset", private=True)
 
-            logger.info(f"Pushing archive to HF: {hf_repo}")
+            logger.info(f"📤 Pushing 1.5GB+ archive to Hugging Face: {hf_repo}...")
             api.upload_file(
                 path_or_fileobj=zip_filename,
-                path_in_repo="processed_data.zip",
+                path_in_repo="processed_images.zip",
                 repo_id=hf_repo,
                 repo_type="dataset"
             )
@@ -148,159 +162,123 @@ class DatasetPreprocessor:
             self.manifest['pushed_to_hf'] = True
             self.manifest['archived'] = True
             self._save_manifest()
+            logger.info("✅ Cloud Sync Complete. Archive stored safely.")
             return True
         except Exception as e:
-            logger.error(f"Failed to push to HF: {e}")
+            logger.error(f"❌ Failed to push archive to HF: {e}")
             return False
 
-    # --- CORE PREPROCESSING LOGIC ---
+    # ============================================================
+    # CORE PROCESSING LOGIC
+    # ============================================================
+
+    def run_full_pipeline(self) -> Tuple[Dict[str, List[Dict]], LaTeXTokenizer]:
+        """Main entry point: Pull from cloud OR Process locally."""
+        
+        # 1. Try to download already-processed images from the cloud
+        if self.pull_from_huggingface():
+            all_processed = {}
+            # Search for the .jsonl metadata files we just extracted
+            for jsonl in Path(self.processed_dir).glob("*.jsonl"):
+                all_processed[jsonl.stem] = self._load_jsonl(str(jsonl))
+            return all_processed, self.tokenizer
+
+        # 2. Local fallback: If no cloud ZIP, we must download and render everything
+        dataset_sources = self.download_all_datasets()
+        all_processed = self.preprocess_all_datasets(dataset_sources)
+
+        if not self.verify_dataset(all_processed):
+            raise RuntimeError("Dataset verification failed after local processing.")
+
+        # 3. Save everything and push to cloud so we don't do this again
+        self.push_to_huggingface(all_processed)
+        
+        return all_processed, self.tokenizer
 
     def download_all_datasets(self) -> Dict[str, Any]:
-        logger.info("=" * 70)
-        logger.info("STEP 1: Downloading all datasets")
-        logger.info("=" * 70)
-
+        logger.info("STEP 1: Downloading raw datasets (Zenodo, Kaggle, HF)")
         dataset_sources = {}
         for ds in self.config.datasets:
-            name = ds.get('name')
-            ds_type = ds.get('type')
-            
+            name, ds_type = ds.get('name'), ds.get('type')
             try:
                 if ds_type == 'huggingface':
-                    repo = ds.get('hf_repo')
-                    logger.info(f"Downloading {name} from HF ({repo})...")
-                    dataset_sources[name] = self.downloader.get_hf_dataset(repo, split="train")
+                    dataset_sources[name] = self.downloader.get_hf_dataset(ds.get('hf_repo'), split="train")
                 elif ds_type == 'kaggle':
-                    slug = ds.get('kaggle_slug')
-                    extract_dir = os.path.join(self.data_dir, name)
-                    logger.info(f"Downloading {name} from Kaggle ({slug})...")
-                    self.downloader.download_kaggle(slug, extract_dir)
-                    dataset_sources[name] = extract_dir
+                    path = os.path.join(self.data_dir, name)
+                    self.downloader.download_kaggle(ds.get('kaggle_slug'), path)
+                    dataset_sources[name] = path
                 elif ds_type == 'url':
-                    url = ds.get('url')
-                    extract_dir = os.path.join(self.data_dir, name)
-                    logger.info(f"Downloading {name} from URL ({url})...")
-                    self.downloader.download_zenodo_zip(url, extract_dir)
-                    dataset_sources[name] = extract_dir
+                    path = os.path.join(self.data_dir, name)
+                    self.downloader.download_zenodo_zip(ds.get('url'), path)
+                    dataset_sources[name] = path
             except Exception as e:
                 logger.error(f"Download failed for {name}: {e}")
                 dataset_sources[name] = None
-                    
         return dataset_sources
 
     def preprocess_all_datasets(self, dataset_sources: Dict[str, Any]) -> Dict[str, List[Dict]]:
-        logger.info("=" * 70)
-        logger.info("STEP 2: Preprocessing ALL datasets")
-        logger.info("=" * 70)
-
+        logger.info("STEP 2: Processing and Rendering Datasets")
         all_processed = {}
+        
         for dataset_name, source in dataset_sources.items():
-            if source is None:
-                all_processed[dataset_name] = []
-                continue
+            if source is None: continue
+            
+            logger.info(f"--- Preprocessing: {dataset_name} ---")
+            _log_memory(f"start {dataset_name}")
 
-            # Check local jsonl cache
-            if self.manifest['datasets'].get(dataset_name, {}).get('preprocessed', False):
-                cached = self._load_processed_cache(dataset_name)
-                if cached:
-                    logger.info(f"{dataset_name}: using cached data ({len(cached)} samples)")
-                    all_processed[dataset_name] = cached
-                    continue
-
-            logger.info(f"\n--- Preprocessing: {dataset_name} ---")
-            _log_memory(f"before {dataset_name}")
-
-            samples = self._preprocess_single_dataset(dataset_name, source)
-
-            logger.info(f"{dataset_name}: {len(samples)} valid samples")
-            _log_memory(f"after {dataset_name}")
-
-            self._save_processed_cache(dataset_name, samples)
-            self.manifest['datasets'][dataset_name] = {
-                'preprocessed': True,
-                'sample_count': len(samples),
-            }
-            self._save_manifest()
-            gc.collect()
-            all_processed[dataset_name] = samples
-
-        self._build_tokenizer(all_processed)
-        self.manifest['all_preprocessed'] = True
-        self._save_manifest()
-        return all_processed
-
-    def _preprocess_single_dataset(self, dataset_name: str, source: Any) -> List[Dict]:
-        samples = []
-        try:
-            # Setup image output dir for this dataset inside processed/images
-            # 1. Parse raw data
+            # 1. Parse/Render using Parser (Saves PNGs to processed/images/)
+            raw_samples = []
             if isinstance(source, str):
-                # Local directory parsing
-                if dataset_name == 'crohme':
-                    raw_samples = self.parser.parse_crohme(source)
-                elif dataset_name == 'hme100k':
-                    raw_samples = self.parser.parse_hme100k(source)
-                elif dataset_name == 'im2latex':
-                    raw_samples = self.parser.parse_im2latex(source)
-                else:
-                    raw_samples = self.parser.parse_crohme(source)
+                if dataset_name == 'crohme': raw_samples = self.parser.parse_crohme(source)
+                elif dataset_name == 'hme100k': raw_samples = self.parser.parse_hme100k(source)
+                elif dataset_name == 'im2latex': raw_samples = self.parser.parse_im2latex(source)
+                else: raw_samples = self.parser.parse_crohme(source)
             else:
-                # HuggingFace dataset object (MathWriting)
-                # This also renders/saves images to disk via parser
+                # MathWriting from HF - saves PNGs into processed_dir
                 raw_samples = self.parser.parse_mathwriting(source, extract_dir=self.processed_dir)
 
-            # 2. Normalize LaTeX
+            # 2. Normalize and Filter
             processed = normalize_corpus(raw_samples)
             
-            # 3. Filter
-            filtered = []
+            valid_samples = []
             for s in processed:
                 latex = s.get('latex', '')
                 if not latex: continue
                 
-                # Tag with dataset name
+                # Token length check
+                if len(self.tokenizer.tokenize(latex)) > self.config.max_token_length:
+                    continue
+                
                 s['dataset_name'] = dataset_name
                 
-                # Check if image path exists (should be inside processed/images)
-                img_path = s.get('image')
-                if isinstance(img_path, str) and os.path.exists(img_path):
-                    filtered.append(s)
+                # Verify that the image was actually created on disk
+                if isinstance(s.get('image'), str) and os.path.exists(s['image']):
+                    valid_samples.append(s)
 
-            samples = filtered
-            del raw_samples, processed
-        except Exception as e:
-            logger.error(f"Preprocessing {dataset_name} failed: {e}")
-        return samples
+            all_processed[dataset_name] = valid_samples
+            self._save_processed_cache(dataset_name, valid_samples)
+            
+            self.manifest['datasets'][dataset_name] = {'preprocessed': True, 'count': len(valid_samples)}
+            _log_memory(f"end {dataset_name}")
+            gc.collect()
 
-    def _build_tokenizer(self, all_processed: Dict[str, List[Dict]]):
-        logger.info("Building global tokenizer...")
-        all_samples = []
-        for samples in all_processed.values():
-            all_samples.extend(samples)
-
-        self.tokenizer = LaTeXTokenizer()
-        self.tokenizer.build_from_samples(all_samples)
+        # 3. Finalize Tokenizer
+        logger.info("Building Global Tokenizer...")
+        flat_list = [s for sublist in all_processed.values() for s in sublist]
+        self.tokenizer.build_from_samples(flat_list)
+        self.tokenizer.save(os.path.join(self.processed_dir, "tokenizer.json"))
         
-        tokenizer_path = os.path.join(self.processed_dir, "tokenizer.json")
-        self.tokenizer.save(tokenizer_path)
-        self.manifest['tokenizer_built'] = True
+        self.manifest['all_preprocessed'] = True
         self.manifest['vocab_size'] = len(self.tokenizer)
+        self._save_manifest()
+        
+        return all_processed
 
     def verify_dataset(self, all_processed: Dict[str, List[Dict]]) -> bool:
-        logger.info("=" * 70)
-        logger.info("STEP 3: Verifying dataset integrity")
-        logger.info("=" * 70)
-
         for name, samples in all_processed.items():
-            if not samples:
-                logger.error(f"  {name}: EMPTY dataset")
-                return False
-            validation = validate_samples(samples, max_check=100)
-            logger.info(f"  {name}: {len(samples)} samples — validation: {'OK' if validation['is_ok'] else 'FAILED'}")
-            if not validation['is_ok']: return False
+            if not samples: return False
+            if not validate_samples(samples, max_check=50)['is_ok']: return False
         return True
-
-    # --- HELPERS ---
 
     def _save_jsonl(self, samples: List[Dict], path: str):
         with open(path, 'w', encoding='utf-8') as f:
@@ -318,28 +296,3 @@ class DatasetPreprocessor:
     def _save_processed_cache(self, dataset_name: str, samples: List[Dict]):
         path = os.path.join(self.processed_dir, f"{dataset_name}.jsonl")
         self._save_jsonl(samples, path)
-
-    def _load_processed_cache(self, dataset_name: str) -> Optional[List[Dict]]:
-        path = os.path.join(self.processed_dir, f"{dataset_name}.jsonl")
-        return self._load_jsonl(path)
-
-    def run_full_pipeline(self) -> Tuple[Dict[str, List[Dict]], LaTeXTokenizer]:
-        """Entry point that manages the entire lifecycle."""
-        # 1. Try cloud recovery
-        if self.pull_from_huggingface():
-            all_processed = {}
-            for jsonl in Path(self.processed_dir).glob("*.jsonl"):
-                all_processed[jsonl.stem] = self._load_jsonl(str(jsonl))
-            return all_processed, self.tokenizer
-
-        # 2. Hard Work (Download + Process)
-        sources = self.download_all_datasets()
-        all_processed = self.preprocess_all_datasets(sources)
-
-        if not self.verify_dataset(all_processed):
-            raise RuntimeError("Dataset verification failed.")
-
-        # 3. Archive & Sync
-        self.push_to_huggingface(all_processed)
-        
-        return all_processed, self.tokenizer
