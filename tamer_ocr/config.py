@@ -15,7 +15,32 @@ class Config:
     log_dir: str = "./logs"
 
     # Dataset Configuration
-    datasets: List[str] = field(default_factory=lambda: [])
+    datasets: List[dict] = field(default_factory=lambda: [
+        {
+            "name": "crohme",
+            "type": "kaggle",
+            "kaggle_slug": "nguyenvo0921/crohme",
+            "parser": "crohme",
+        },
+        {
+            "name": "hme100k",
+            "type": "kaggle",
+            "kaggle_slug": "muhammadhanif/hme100k",
+            "parser": "hme100k",
+        },
+        {
+            "name": "im2latex",
+            "type": "kaggle",
+            "kaggle_slug": "shahrukhkhan/im2latex",
+            "parser": "im2latex",
+        },
+        {
+            "name": "mathwriting",
+            "type": "huggingface",
+            "hf_repo": "MathInstruct/MathWriting",
+            "parser": "crohme",
+        },
+    ])
     auto_download: bool = False
     skip_validation: bool = False
 
