@@ -2,7 +2,7 @@
 Checkpoint utilities for TAMER training v2.1.
 
 - Saves full training state: model, optimizer, scheduler, scaler, epoch, step
-- Pushes checkpoints to Hugging Face Hub (NOT Google Drive)
+- Pushes checkpoints to Hugging Face Hub
 - Finds latest checkpoint for auto-resume
 - Keeps last N local checkpoints to avoid filling disk
 """
@@ -20,7 +20,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler,  # torch.amp.GradScaler
+    scaler,
     epoch: int,
     step: int,
     metrics: Dict[str, Any],
@@ -60,24 +60,31 @@ def load_checkpoint(
 ) -> Tuple[int, int, Dict[str, Any]]:
     """
     Load a training checkpoint.
-
-    Returns:
-        (epoch, step, metrics) tuple
+    FIX: weights_only=True for security.
     """
     if not os.path.exists(path):
         logger.warning(f"No checkpoint found at {path}")
         return 0, 0, {}
 
     try:
-        ckpt = torch.load(path, map_location=device, weights_only=False)
+        # FIX: Security risk fix - set weights_only=True
+        ckpt = torch.load(path, map_location=device, weights_only=True)
 
-        model.load_state_dict(ckpt['model_state_dict'])
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+        else:
+            # Handle cases where the whole model might have been saved
+            logger.warning("model_state_dict not found in checkpoint, attempting full load.")
+            model.load_state_dict(ckpt)
 
         if optimizer and 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         if scheduler and 'scheduler_state_dict' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            try:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            except Exception as e:
+                logger.warning(f"Could not load scheduler state: {e}. This is normal if total_steps changed.")
 
         if scaler and 'scaler_state_dict' in ckpt:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
@@ -95,23 +102,13 @@ def load_checkpoint(
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
-    """
-    Find the most recent checkpoint in a directory.
-
-    Looks for epoch_*.pt files, sorted by modification time.
-    Also checks for best.pt.
-
-    Returns:
-        Path to the latest checkpoint, or None if no checkpoints found
-    """
+    """Find the most recent checkpoint in a directory."""
     if not os.path.exists(checkpoint_dir):
         return None
 
-    # Look for epoch-based checkpoints
     ckpt_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pt"))
 
     if not ckpt_files:
-        # Fallback: look for best.pt
         best_path = os.path.join(checkpoint_dir, "best.pt")
         if os.path.exists(best_path):
             return best_path
@@ -123,9 +120,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
 
 
 def cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int = 3):
-    """
-    Keep only the last N epoch checkpoints (best.pt is always kept).
-    """
+    """Keep only the last N epoch checkpoints."""
     ckpt_files = sorted(
         glob.glob(os.path.join(checkpoint_dir, "epoch_*.pt")),
         key=os.path.getmtime,
@@ -145,14 +140,13 @@ def push_checkpoint_to_hf(checkpoint_path: str, config, epoch: int, is_best: boo
     hf_repo = getattr(config, 'hf_repo_id', '')
 
     if not hf_token or not hf_repo:
-        logger.info("HF token or repo not configured — skipping checkpoint push")
         return
 
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=hf_token)
 
-        # Auto-resolve username
+        # Auto-resolve username if needed
         if '/' not in hf_repo:
             username = api.whoami()['name']
             hf_repo = f"{username}/{hf_repo}"

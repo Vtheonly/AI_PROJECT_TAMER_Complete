@@ -1,54 +1,68 @@
-# Tokens and secrets
-*.txt
-!.gitignore
-!requirements.txt
-!CONTRIBUTING.txt
-!README.txt
+# TAMER OCR - Fixed .gitignore
+# ===========================
 
-# Python
+# Python artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual Environments
 venv/
 env/
 ENV/
+.env
+.venv
 
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
+.project
+.pydevproject
+.settings/
 
-# Checkpoints and models
-*.pth
-*.pt
-checkpoints/
-models/
-*.ckpt
-
-# Data
-
-*.csv
-*.json
-
-# Environment variables
-.env
-.env.local
-*.env
-
-# Token files
-token.txt
-*.token
-*.key
-
-# OS
+# OS artifacts
 .DS_Store
 Thumbs.db
+
+# TAMER Specific - Ignore large data and model weights
+# We ignore the directories, but NOT the specific .json extension 
+# to ensure tokenizer.json can be tracked.
+data/
+checkpoints/
+logs/
+outputs/
+
+# Re-include specific important files if they are inside ignored dirs
+!data/processed/tokenizer.json
+!requirements.txt
+
+# Weights and temporary files
+*.pt
+*.pth
+*.ckpt
+*.log
+error.txt
+
+# Environment/Secrets
+*.token
+*.key
+.env*

@@ -13,6 +13,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import csv
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger("TAMER.Parser")
 
@@ -216,18 +217,31 @@ class DatasetParser:
                     inkml_files.append(os.path.join(root, f))
 
         if inkml_files:
-            logger.info(f"Found {len(inkml_files)} .inkml files. Rendering to PNGs...")
+            logger.info(f"Found {len(inkml_files)} .inkml files. Rendering to PNGs in parallel...")
             img_out_dir = os.path.join(extract_dir, "images")
             os.makedirs(img_out_dir, exist_ok=True)
 
-            for idx, inkml_path in enumerate(inkml_files):
-                base_name = os.path.splitext(os.path.basename(inkml_path))[0]
-                out_img = os.path.join(img_out_dir, f"{base_name}.png")
-                latex = self._render_inkml(inkml_path, out_img)
-                if latex and os.path.exists(out_img):
-                    samples.append({"image": out_img, "latex": latex, "dataset_name": "crohme"})
-                if (idx + 1) % 1000 == 0:
-                    logger.info(f"  Rendered {idx + 1}/{len(inkml_files)} CROHME files...")
+            # FIX: Parallelize InkML rendering to save hours of processing time
+            def process_inkml(inkml_path):
+                try:
+                    base_name = os.path.splitext(os.path.basename(inkml_path))[0]
+                    out_img = os.path.join(img_out_dir, f"{base_name}.png")
+                    latex = self._render_inkml(inkml_path, out_img)
+                    if latex and os.path.exists(out_img):
+                        return {"image": out_img, "latex": latex, "dataset_name": "crohme"}
+                except Exception:
+                    pass
+                return None
+
+            max_workers = min(32, (os.cpu_count() or 1) * 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_inkml, path): path for path in inkml_files}
+                for idx, future in enumerate(as_completed(futures)):
+                    res = future.result()
+                    if res:
+                        samples.append(res)
+                    if (idx + 1) % 5000 == 0:
+                        logger.info(f"  Rendered {idx + 1}/{len(inkml_files)} CROHME files...")
 
             logger.info(f"Successfully rendered {len(samples)} CROHME images from InkML.")
             return samples
@@ -342,8 +356,6 @@ class DatasetParser:
                             h = hashlib.md5(latex.encode('utf-8')).hexdigest()[:8]
                             img_path = os.path.join(img_dir, f"img_{idx}_{h}.png")
                             if not os.path.exists(img_path):
-                                # CRITICAL FIX: Convert to Numpy Array and back to break HF _idat references 
-                                # This fully solves the "AttributeError: '_idat' object has no attribute 'fileno'" error
                                 safe_img = Image.fromarray(np.array(pil_img))
                                 safe_img.save(img_path, format="PNG")
                             samples.append({"image": img_path, "latex": latex, "dataset_name": "mathwriting"})

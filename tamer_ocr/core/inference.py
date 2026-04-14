@@ -6,6 +6,7 @@ Key changes from old version:
 - NO pointer scores
 - NO coverage tracking
 - Added length penalty to prevent short predictions
+- FIX: Implemented Batched Beam Search for massive speedup
 """
 
 import torch
@@ -29,11 +30,11 @@ def beam_search(
     device: torch.device = None,
 ) -> List[int]:
     """
-    Standard beam search decoding.
+    Batched beam search decoding for a single image.
     
     Args:
         model: TAMERModel instance
-        image: (1, 1, H, W) input image tensor
+        image: (1, 3, H, W) input image tensor
         sos_id: Start-of-sequence token ID
         eos_id: End-of-sequence token ID
         pad_id: Padding token ID
@@ -59,52 +60,58 @@ def beam_search(
     for step in range(max_len):
         if not beams:
             break
-        
-        all_candidates = []
-        
+            
+        # Filter out completed beams
+        active_beams = []
         for tokens, score in beams:
-            # If this beam has ended, move to completed
             if tokens[-1] == eos_id:
-                # Apply length penalty
                 length = len(tokens) - 1  # Exclude SOS
                 penalized_score = score / ((length ** length_penalty) if length > 0 else 1.0)
                 completed.append((tokens, penalized_score))
-                continue
+            else:
+                active_beams.append((tokens, score))
+                
+        if not active_beams:
+            break
             
-            # Prepare input
-            tgt_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-            
-            # Generate causal mask
-            L = len(tokens)
-            tgt_mask = model.decoder.generate_causal_mask(L, device)
-            
-            # Forward pass
-            logits = model.decoder(tgt_ids, memory, tgt_mask)  # (1, L, V)
-            next_logits = logits[0, -1, :]  # (V,)
-            
-            # Log probabilities
-            log_probs = F.log_softmax(next_logits, dim=-1)
-            
-            # Get top-k candidates
-            topk_log_probs, topk_indices = log_probs.topk(beam_width)
-            
-            for i in range(beam_width):
-                new_token = topk_indices[i].item()
-                new_score = score + topk_log_probs[i].item()
-                all_candidates.append((tokens + [new_token], new_score))
+        # FIX: Batch the active beams together for a single forward pass
+        num_active = len(active_beams)
         
-        # Select top beam_width candidates
+        # (num_active, L)
+        tgt_ids = torch.tensor([b[0] for b in active_beams], dtype=torch.long, device=device)
+        
+        # Expand memory to match the number of active beams
+        # (num_active, S, D)
+        batched_memory = memory.expand(num_active, -1, -1)
+        
+        L = tgt_ids.size(1)
+        tgt_mask = model.decoder.generate_causal_mask(L, device)
+        
+        # Forward pass for all beams at once
+        # logits: (num_active, L, V)
+        logits = model.decoder(tgt_ids, batched_memory, tgt_mask)
+        
+        # We only care about the last token prediction
+        # next_logits: (num_active, V)
+        next_logits = logits[:, -1, :]
+        log_probs = F.log_softmax(next_logits, dim=-1)  # (num_active, V)
+        
+        # Get top-k candidates for each beam
+        # topk_log_probs, topk_indices: (num_active, beam_width)
+        topk_log_probs, topk_indices = log_probs.topk(beam_width, dim=-1)
+        
+        all_candidates = []
+        for i in range(num_active):
+            current_tokens, current_score = active_beams[i]
+            for j in range(beam_width):
+                new_token = topk_indices[i, j].item()
+                new_score = current_score + topk_log_probs[i, j].item()
+                all_candidates.append((current_tokens + [new_token], new_score))
+        
+        # Select top beam_width candidates overall
         all_candidates.sort(key=lambda x: x[1], reverse=True)
         beams = all_candidates[:beam_width]
         
-        # Early termination if all beams ended
-        if all(b[0][-1] == eos_id for b in beams):
-            for tokens, score in beams:
-                length = len(tokens) - 1
-                penalized_score = score / ((length ** length_penalty) if length > 0 else 1.0)
-                completed.append((tokens, penalized_score))
-            break
-    
     # If no completed beams, take the best incomplete one
     if not completed:
         for tokens, score in beams:
@@ -128,36 +135,77 @@ def beam_search(
 @torch.no_grad()
 def greedy_decode(
     model,
-    image: torch.Tensor,
+    images: torch.Tensor,
     sos_id: int,
     eos_id: int,
     max_len: int = 200,
     device: torch.device = None,
-) -> List[int]:
-    """Simple greedy decoding for fast inference."""
+) -> List[List[int]]:
+    """
+    Batched greedy decoding for fast inference.
+    
+    Args:
+        model: TAMERModel instance
+        images: (B, 3, H, W) input image tensor
+        sos_id: Start-of-sequence token ID
+        eos_id: End-of-sequence token ID
+        max_len: Maximum output sequence length
+        device: Device for tensors
+        
+    Returns:
+        List of Lists containing token IDs for each image in the batch
+    """
     model.eval()
     if device is None:
-        device = image.device
+        device = images.device
     
-    memory = model.encode(image)
-    tokens = [sos_id]
+    B = images.size(0)
+    memory = model.encode(images)  # (B, S, D)
+    
+    # Initialize tokens for the whole batch
+    # (B, 1)
+    tokens = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
+    
+    # Keep track of which sequences in the batch have finished
+    unfinished = torch.ones(B, dtype=torch.bool, device=device)
     
     for _ in range(max_len):
-        tgt_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        L = len(tokens)
+        L = tokens.size(1)
         tgt_mask = model.decoder.generate_causal_mask(L, device)
         
-        logits = model.decoder(tgt_ids, memory, tgt_mask)
-        next_token = logits[0, -1, :].argmax().item()
-        tokens.append(next_token)
+        # (B, L, V)
+        logits = model.decoder(tokens, memory, tgt_mask)
         
-        if next_token == eos_id:
+        # Get the most likely next token for each sequence
+        # (B,)
+        next_tokens = logits[:, -1, :].argmax(dim=-1)
+        
+        # If a sequence is already finished, force it to predict EOS
+        next_tokens = torch.where(unfinished, next_tokens, torch.tensor(eos_id, device=device))
+        
+        # Append to sequences
+        tokens = torch.cat([tokens, next_tokens.unsqueeze(1)], dim=1)
+        
+        # Update unfinished mask
+        unfinished = unfinished & (next_tokens != eos_id)
+        
+        # Early stopping if all sequences in the batch are finished
+        if not unfinished.any():
             break
+            
+    # Convert to list of lists and remove SOS/EOS
+    result = []
+    tokens_list = tokens.cpu().tolist()
     
-    # Remove SOS and EOS
-    if tokens[0] == sos_id:
-        tokens = tokens[1:]
-    if tokens and tokens[-1] == eos_id:
-        tokens = tokens[:-1]
-    
-    return tokens
+    for seq in tokens_list:
+        # Remove SOS
+        if seq[0] == sos_id:
+            seq = seq[1:]
+            
+        # Truncate at first EOS
+        if eos_id in seq:
+            seq = seq[:seq.index(eos_id)]
+            
+        result.append(seq)
+        
+    return result

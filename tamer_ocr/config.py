@@ -17,14 +17,14 @@ class Config:
     datasets: List[dict] = field(default_factory=lambda: [
         {
             "name": "crohme",
-            "type": "url",  # <--- CHANGED from kaggle to url to bypass 403
+            "type": "url",
             "url": "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1",
             "parser": "crohme",
         },
         {
             "name": "hme100k",
             "type": "kaggle",
-            "kaggle_slug": "prajwalchy/hme100k-dataset", # <--- Correct slug
+            "kaggle_slug": "prajwalchy/hme100k-dataset",
             "parser": "hme100k",
         },
         {
@@ -43,7 +43,7 @@ class Config:
     auto_download: bool = False
     skip_validation: bool = False
 
-    # Image Settings — FIXED: 256 height, 1024 width with aspect ratio preservation
+    # Image Settings
     img_height: int = 256
     img_width: int = 1024
 
@@ -51,7 +51,7 @@ class Config:
     max_token_length: int = 150     
     max_aspect_ratio: float = 10.0  
 
-    # Model Architecture — Swin-Base + Standard Transformer Decoder
+    # Model Architecture
     encoder_name: str = "swin_base_patch4_window7_224"
     d_model: int = 512
     nhead: int = 8
@@ -65,6 +65,7 @@ class Config:
     accumulation_steps: int = 4  
     num_workers: int = 2
     num_epochs: int = 150
+    early_stopping_patience: int = 15  # Added to prevent overfitting
     encoder_lr: float = 1e-5
     decoder_lr: float = 1e-4
     weight_decay: float = 1e-4
@@ -94,12 +95,12 @@ class Config:
     hf_dataset_repo_id: str = ""   
 
     # Kaggle
-    kaggle_username: str = "merselfares"
+    kaggle_username: str = ""  # Removed hardcoded username
     kaggle_key: str = ""
 
     phase1_steps: int = 0        
     phase2_start_step: int = 0   
-    total_training_steps: int = 50000 
+    total_training_steps: int = 0  # Will be calculated dynamically in trainer
 
     def __post_init__(self):
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:

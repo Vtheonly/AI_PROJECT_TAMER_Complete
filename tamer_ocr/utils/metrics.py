@@ -2,11 +2,24 @@
 Evaluation metrics for Math OCR.
 
 - ExpRate: Exact match rate after stripping spaces
-- Edit Distance: Levenshtein distance
-- Symbol Error Rate (SER)
+- Edit Distance: Token-level Levenshtein distance
+- Symbol Error Rate (SER): Token-level error rate
 """
 
+import re
 from typing import List, Dict
+
+
+def tokenize_latex(latex: str) -> List[str]:
+    """
+    Tokenize LaTeX string into commands and individual characters for accurate Edit Distance.
+    Example: '\\frac{a}{b}' -> ['\\frac', '{', 'a', '}', '{', 'b', '}']
+    """
+    # Remove spaces first to standardize
+    clean_latex = latex.replace(' ', '')
+    # Regex: match \command or a single character
+    tokens = re.findall(r'\\[a-zA-Z]+|.', clean_latex)
+    return tokens
 
 
 def edit_distance(s1: List[str], s2: List[str]) -> int:
@@ -36,16 +49,21 @@ def calculate_metrics(pred_latex: str, gt_latex: str) -> Dict[str, float]:
     Returns:
         Dict with 'exact_match', 'edit_dist', 'ser', 'leq1'
     """
+    # ExpRate: Exact match ignoring spaces
     pred_clean = pred_latex.replace(' ', '')
     gt_clean = gt_latex.replace(' ', '')
     
     exact_match = float(pred_clean == gt_clean)
     
-    dist = edit_distance(list(pred_clean), list(gt_clean))
+    # Edit Distance: Token-level to preserve LaTeX semantics
+    pred_tokens = tokenize_latex(pred_latex)
+    gt_tokens = tokenize_latex(gt_latex)
+    
+    dist = edit_distance(pred_tokens, gt_tokens)
     leq1 = float(dist <= 1)
     
-    # Symbol Error Rate
-    gt_len = max(len(list(gt_clean)), 1)
+    # Symbol Error Rate (SER)
+    gt_len = max(len(gt_tokens), 1)
     ser = dist / gt_len
     
     return {

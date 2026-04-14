@@ -67,20 +67,21 @@ class MathDataset(Dataset):
         else:
             raise ValueError(f"Unsupported image type: {type(img_source)}")
 
-        # Convert to grayscale to standardize inputs before padding
-        img = img.convert('L')
+        # FIX: Convert to true RGB to match Swin pretraining!
+        # Do NOT use 'L' (grayscale) and expand, as it breaks ImageNet normalization.
+        img = img.convert('RGB')
         arr = np.array(img)
 
         # Handle edge cases (empty or corrupt images)
         if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
-            canvas = np.full((target_h, target_w), 255, dtype=np.uint8)
+            canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
         else:
-            h, w = arr.shape
+            h, w, c = arr.shape
             
             # Aspect ratio filter (optional based on config)
             aspect = max(w, h) / max(min(w, h), 1)
             if aspect > self.config.max_aspect_ratio:
-                canvas = np.full((target_h, target_w), 255, dtype=np.uint8)
+                canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
             else:
                 # Step 1: Scale height to target_h
                 scale = target_h / h
@@ -91,27 +92,24 @@ class MathDataset(Dataset):
                     scale = target_w / w
                     new_h = int(h * scale)
                     arr = cv2.resize(arr, (target_w, new_h), interpolation=cv2.INTER_AREA)
-                    canvas = np.full((target_h, target_w), 255, dtype=np.uint8)
+                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
                     y_offset = (target_h - new_h) // 2
-                    canvas[y_offset:y_offset+new_h, :] = arr
+                    canvas[y_offset:y_offset+new_h, :, :] = arr
                 else:
                     # Resize height to target_h, pad width
                     arr = cv2.resize(arr, (new_w, target_h), interpolation=cv2.INTER_AREA)
-                    canvas = np.full((target_h, target_w), 255, dtype=np.uint8)
-                    canvas[:, :new_w] = arr
+                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                    canvas[:, :new_w, :] = arr
 
         # Apply augmentation if provided (e.g., rotation, noise)
         if self.transform:
             canvas = self.transform(image=canvas)['image']
 
         # === Normalization and Tensor Conversion ===
-        # 1. Convert to [0, 1] range
-        tensor = torch.from_numpy(canvas.astype(np.float32)) / 255.0
-        
-        # 2. Expand to 3 channels (required by Swin backbone)
-        tensor = tensor.unsqueeze(0).expand(3, -1, -1)  # (3, 256, 1024)
+        # 1. Convert to [0, 1] range and permute to (C, H, W)
+        tensor = torch.from_numpy(canvas.astype(np.float32)).permute(2, 0, 1) / 255.0
 
-        # 3. Apply standard ImageNet Normalization
+        # 2. Apply standard ImageNet Normalization
         # Mean: [0.485, 0.456, 0.406], Std: [0.229, 0.224, 0.225]
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -132,9 +130,8 @@ class MathDataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to load image (idx={idx}): {e}")
             # Return a blank normalized tensor as fallback
-            blank = np.full((self.config.img_height, self.config.img_width), 255, dtype=np.uint8)
-            tensor = torch.from_numpy(blank.astype(np.float32)) / 255.0
-            tensor = tensor.unsqueeze(0).expand(3, -1, -1)
+            blank = np.full((self.config.img_height, self.config.img_width, 3), 255, dtype=np.uint8)
+            tensor = torch.from_numpy(blank.astype(np.float32)).permute(2, 0, 1) / 255.0
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             tensor = (tensor - mean) / std

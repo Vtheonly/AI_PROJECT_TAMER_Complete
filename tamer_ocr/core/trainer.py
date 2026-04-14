@@ -8,16 +8,6 @@ Strict pipeline order:
   4. Auto-resume from latest checkpoint if available
   5. Train with epoch-based checkpointing (every 3 epochs)
   6. Push checkpoints to HuggingFace model repo
-
-Key features:
-- AMP (float16) with GradScaler
-- Differential learning rates: Encoder 1e-5, Decoder 1e-4
-- OneCycleLR scheduler with pct_start=0.1
-- Label smoothing 0.1 in CrossEntropyLoss
-- Gradient accumulation for effective batch size 32
-- Epoch-based checkpointing every 3 epochs, pushed to HF
-- Auto-resume from latest checkpoint on interruption
-- Dynamic temperature sampling decay
 """
 
 import os
@@ -60,17 +50,16 @@ logger = logging.getLogger("TAMER.Trainer")
 class Trainer:
     """
     Orchestrates the entire training pipeline.
-
-    All logic lives here — the notebook just calls trainer.run().
     """
 
     def __init__(self, config: Config):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_amp = self.device.type == 'cuda'
 
         # Setup logging
         self.logger = setup_logger("TAMER.Trainer", config.log_dir)
-        self.logger.info(f"Device: {self.device}")
+        self.logger.info(f"Device: {self.device} (AMP Enabled: {self.use_amp})")
         if torch.cuda.is_available():
             self.logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
             props = torch.cuda.get_device_properties(0)
@@ -86,9 +75,9 @@ class Trainer:
         # Optimizer & Scheduler
         self.optimizer = None
         self.scheduler = None
-        self.scaler = None  # AMP GradScaler
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        # Loss — pad_id updated after tokenizer is built
+        # Loss
         self.criterion = LabelSmoothedCELoss(
             pad_id=0,
             label_smoothing=config.label_smoothing,
@@ -99,6 +88,7 @@ class Trainer:
         self.global_step = 0
         self.best_exp_rate = 0.0
         self.best_edit_dist = float('inf')
+        self.epochs_without_improvement = 0
 
         # Data
         self.train_dataset = None
@@ -109,7 +99,7 @@ class Trainer:
         # Dataset ranges for temperature sampling
         self.dataset_ranges = {}
 
-        # Processed samples (from preprocessor)
+        # Processed samples
         self.train_samples = []
         self.val_samples = []
 
@@ -118,19 +108,12 @@ class Trainer:
         self.epoch_start_time = time.time()
 
     # ----------------------------------------------------------------
-    # PHASE 1: Data Preprocessing (strict — must complete before training)
+    # PHASE 1: Data Preprocessing
     # ----------------------------------------------------------------
 
     def preprocess_data(self):
         """
-        Run the FULL preprocessing pipeline:
-          1. Download all 4 datasets
-          2. Preprocess ALL datasets completely
-          3. Verify dataset is clean
-          4. Push to HuggingFace dataset repo
-          5. Only then return for training
-
-        If already preprocessed, loads from HF or local cache.
+        Run the FULL preprocessing pipeline.
         """
         self.logger.info("=" * 70)
         self.logger.info("PHASE 1: Data Preprocessing (STRICT — no training until complete)")
@@ -146,7 +129,7 @@ class Trainer:
 
         self.logger.info(f"Total preprocessed samples: {len(all_samples)}")
 
-        # Filter by token length (double-check)
+        # Filter by token length
         filtered = []
         for s in all_samples:
             latex = s.get('latex', '')
@@ -158,13 +141,23 @@ class Trainer:
 
         self.logger.info(f"After token length filter: {len(filtered)}")
 
-        # Split: 90% train, 10% val
-        random.seed(42)
-        random.shuffle(filtered)
+        # FIX: Stratified split per dataset to maintain distribution and ensure contiguous ranges
+        grouped = {}
+        for s in filtered:
+            ds = s.get('dataset_name', 'unknown')
+            if ds not in grouped:
+                grouped[ds] = []
+            grouped[ds].append(s)
 
-        split_idx = int(len(filtered) * 0.9)
-        self.train_samples = filtered[:split_idx]
-        self.val_samples = filtered[split_idx:]
+        self.train_samples = []
+        self.val_samples = []
+
+        for ds, ds_samples in grouped.items():
+            random.seed(42)
+            random.shuffle(ds_samples)
+            split_idx = int(len(ds_samples) * 0.9)
+            self.train_samples.extend(ds_samples[:split_idx])
+            self.val_samples.extend(ds_samples[split_idx:])
 
         self.logger.info(f"Train: {len(self.train_samples)}, Val: {len(self.val_samples)}")
         self.logger.info(f"Vocabulary size: {len(self.tokenizer)}")
@@ -238,18 +231,21 @@ class Trainer:
 
     def _compute_dataset_ranges(self, samples):
         """Compute per-dataset index ranges for temperature sampling."""
+        # FIX: Samples are now contiguous by dataset thanks to the stratified split
         self.dataset_ranges = {}
-        dataset_counts = {}
-
+        current_idx = 0
+        
         for s in samples:
             name = s.get('dataset_name', 'unknown')
-            dataset_counts[name] = dataset_counts.get(name, 0) + 1
+            if name not in self.dataset_ranges:
+                self.dataset_ranges[name] = [current_idx, current_idx + 1]
+            else:
+                self.dataset_ranges[name][1] = current_idx + 1
+            current_idx += 1
 
-        offset = 0
-        for name, count in dataset_counts.items():
-            self.dataset_ranges[name] = (offset, offset + count)
-            offset += count
-            self.logger.info(f"  {name}: {count} samples (range {offset-count}-{offset})")
+        for name, rng in self.dataset_ranges.items():
+            self.dataset_ranges[name] = tuple(rng)
+            self.logger.info(f"  {name}: {rng[1]-rng[0]} samples (range {rng[0]}-{rng[1]})")
 
     # ----------------------------------------------------------------
     # PHASE 3: Model Initialization
@@ -292,42 +288,32 @@ class Trainer:
 
         self.logger.info(f"Encoder LR: {self.config.encoder_lr}, Decoder LR: {self.config.decoder_lr}")
 
+        # FIX: Dynamically calculate total training steps to prevent OneCycleLR crash
+        steps_per_epoch = len(self.train_loader) // self.config.accumulation_steps
+        if steps_per_epoch == 0:
+            steps_per_epoch = 1
+        self.config.total_training_steps = steps_per_epoch * self.config.num_epochs
+
         # OneCycleLR scheduler
-        total_steps = self.config.total_training_steps
         self.scheduler = OneCycleLR(
             self.optimizer,
             max_lr=[self.config.encoder_lr, self.config.decoder_lr],
-            total_steps=total_steps,
+            total_steps=self.config.total_training_steps,
             pct_start=self.config.pct_start,
             anneal_strategy='cos',
             div_factor=25.0,
             final_div_factor=10000.0,
         )
 
-        self.logger.info(f"OneCycleLR: total_steps={total_steps}, pct_start={self.config.pct_start}")
-
-        # AMP GradScaler
-        self.scaler = torch.cuda.amp.GradScaler()
-
+        self.logger.info(f"OneCycleLR: total_steps={self.config.total_training_steps}, pct_start={self.config.pct_start}")
         self.logger.info("Model initialization complete.")
 
     # ----------------------------------------------------------------
-    # PHASE 4: Training Loop (epoch-based, checkpoint every 3 epochs)
+    # PHASE 4: Training Loop
     # ----------------------------------------------------------------
 
     def train(self):
-        """
-        Main training loop.
-
-        - Epoch-based iteration
-        - AMP autocast
-        - Gradient accumulation
-        - Dynamic temperature decay
-        - Save checkpoint every 3 epochs
-        - Evaluate every epoch
-        - Auto-resume from latest checkpoint
-        - Push checkpoints to HuggingFace
-        """
+        """Main training loop."""
         self.logger.info("=" * 70)
         self.logger.info("PHASE 3: Training Loop")
         self.logger.info("=" * 70)
@@ -405,7 +391,14 @@ class Trainer:
             )
 
             # Evaluate
-            self._evaluate()
+            metrics = self._evaluate()
+
+            # FIX: Early Stopping Logic
+            is_best = metrics['exact_match'] > self.best_exp_rate
+            if is_best:
+                self.epochs_without_improvement = 0
+            else:
+                self.epochs_without_improvement += 1
 
             # Checkpoint every N epochs
             if self.current_epoch % self.config.checkpoint_every_epochs == 0:
@@ -415,6 +408,11 @@ class Trainer:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Early Stopping Check
+            if self.epochs_without_improvement >= self.config.early_stopping_patience:
+                self.logger.info(f"Early stopping triggered after {self.epochs_without_improvement} epochs without improvement.")
+                break
 
         self.logger.info("=" * 70)
         self.logger.info("Training complete!")
@@ -426,7 +424,7 @@ class Trainer:
         images = batch['image'].to(self.device, non_blocking=True)
         ids = batch['ids'].to(self.device, non_blocking=True)
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=torch.float16):
             logits = self.model(images, ids)
             loss = self.criterion(logits, ids)
             loss = loss / self.config.accumulation_steps
@@ -456,7 +454,7 @@ class Trainer:
                 images = batch['image'].to(self.device)
                 ids = batch['ids'].to(self.device)
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=torch.float16):
                     logits = self.model(images, ids)
                     loss = self.criterion(logits, ids)
                 total_loss += loss.item()
@@ -560,7 +558,7 @@ class Trainer:
         return metrics
 
     # ----------------------------------------------------------------
-    # Checkpointing — epoch-based, pushed to HF
+    # Checkpointing
     # ----------------------------------------------------------------
 
     def _save_epoch_checkpoint(self):
@@ -588,8 +586,6 @@ class Trainer:
     def _auto_resume(self) -> bool:
         """
         Auto-resume from the latest checkpoint if one exists.
-
-        Returns True if resumed, False if starting fresh.
         """
         latest = find_latest_checkpoint(self.config.checkpoint_dir)
         if latest is None:
@@ -632,39 +628,23 @@ class Trainer:
         self.best_edit_dist = metrics.get('edit_dist', float('inf'))
 
     # ----------------------------------------------------------------
-    # MAIN: Full Pipeline (strict order)
+    # MAIN: Full Pipeline
     # ----------------------------------------------------------------
 
     def run(self, resume_from: str = None):
         """
-        Run the complete pipeline in strict order:
-
-        1. Preprocess ALL datasets and push to HF
-        2. Create data loaders
-        3. Build model
-        4. Auto-resume from latest checkpoint (if any)
-        5. Train
-        6. Final beam search evaluation
+        Run the complete pipeline in strict order.
         """
-        # Step 1: Preprocess data (STRICT — no training until complete)
         self.preprocess_data()
-
-        # Step 2: Create data loaders
         self.create_dataloaders()
-
-        # Step 3: Build model
         self.build_model()
 
-        # Step 4: Resume — auto-detect latest, or use specified path
         if resume_from and os.path.exists(resume_from):
             self.resume_from_checkpoint(resume_from)
         else:
             self._auto_resume()
 
-        # Step 5: Train
         self.train()
-
-        # Step 6: Final beam search evaluation
         self.evaluate_with_beam_search(max_samples=500)
 
         self.logger.info("=" * 70)

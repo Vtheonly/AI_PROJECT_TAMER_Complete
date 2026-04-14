@@ -48,8 +48,10 @@ def train_step(
 
     images = batch['image'].to(device, non_blocking=True)
     ids = batch['ids'].to(device, non_blocking=True)
+    
+    use_amp = device.type == 'cuda'
 
-    with torch.autocast(device_type='cuda', dtype=torch.float16):
+    with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
         logits = model(images, ids)
         loss = criterion(logits, ids)
         loss = loss / accumulation_steps
@@ -113,9 +115,10 @@ def eval_step(
     model.eval()
     images = batch['image'].to(device)
     ids = batch['ids'].to(device)
+    use_amp = device.type == 'cuda'
 
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
             logits = model(images, ids)
             loss = criterion(logits, ids)
 
@@ -123,26 +126,31 @@ def eval_step(
     gts = []
 
     with torch.no_grad():
-        for i in range(images.size(0)):
-            if use_beam_search:
+        if use_beam_search:
+            # Beam search processes one image at a time (though beams are batched internally)
+            for i in range(images.size(0)):
                 pred_tokens = beam_search(
                     model, images[i:i+1],
                     tokenizer.sos_id, tokenizer.eos_id, tokenizer.pad_id,
                     beam_width=beam_width, max_len=max_len,
                     length_penalty=length_penalty, device=device,
                 )
-            else:
-                pred_tokens = greedy_decode(
-                    model, images[i:i+1],
-                    tokenizer.sos_id, tokenizer.eos_id,
-                    max_len=max_len, device=device,
-                )
+                pred_latex = tokenizer.decode(pred_tokens, skip_special=True)
+                preds.append(pred_latex)
+        else:
+            # FIX: Use the new fully batched greedy_decode for massive speedup
+            pred_tokens_batch = greedy_decode(
+                model, images,
+                tokenizer.sos_id, tokenizer.eos_id,
+                max_len=max_len, device=device,
+            )
+            for pred_tokens in pred_tokens_batch:
+                preds.append(tokenizer.decode(pred_tokens, skip_special=True))
 
-            pred_latex = tokenizer.decode(pred_tokens, skip_special=True)
+        # Decode ground truths
+        for i in range(images.size(0)):
             gt_ids = ids[i].cpu().tolist()
             gt_latex = tokenizer.decode(gt_ids, skip_special=True)
-
-            preds.append(pred_latex)
             gts.append(gt_latex)
 
     return loss.item(), preds, gts
@@ -204,6 +212,9 @@ def evaluate_full(
             sample_count += len(preds)
 
             if max_samples and sample_count >= max_samples:
+                # FIX: Truncate to exact max_samples if we overshot
+                all_preds = all_preds[:max_samples]
+                all_targets = all_targets[:max_samples]
                 break
 
     metrics = compute_batch_metrics(all_preds, all_targets)

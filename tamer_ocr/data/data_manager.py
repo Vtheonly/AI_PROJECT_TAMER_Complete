@@ -103,7 +103,6 @@ class DataManager:
                 return []
                 
             extract_dir = os.path.join(self.data_dir, "mathwriting")
-            # CHANGED: Removed max_samples parameter to consume full dataset
             samples = self.parser.parse_mathwriting(hf_dataset, extract_dir=extract_dir)
             self._stage2_cache = samples
             
@@ -116,42 +115,37 @@ class DataManager:
             self._stage2_cache = []
             return []
  
- 
     def get_stage3_crohme(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-            if self._stage3_cache is not None and not force_refresh:
-                crohme = self._load_stage3_crohme_cache()
-                return crohme
-                
-            logger.info("Loading Stage 3a: CROHME (Competition Handwritten)")
-            cache_file = os.path.join(self.cache_dir, "stage3_crohme.json")
+        if self._stage3_cache is not None and not force_refresh:
+            crohme = self._load_stage3_crohme_cache()
+            return crohme
             
-            if not force_refresh and os.path.exists(cache_file):
-                try:
-                    samples = self._load_cache(cache_file)
-                    if samples:
-                        logger.info(f"Loaded Stage 3 CROHME from cache: {len(samples)} samples")
-                        return samples
-                except Exception as e:
-                    logger.warning(f"Cache load failed, refreshing: {e}")
-            
-            # Download from Zenodo and let the Parser render the InkML files into Images!
+        logger.info("Loading Stage 3a: CROHME (Competition Handwritten)")
+        cache_file = os.path.join(self.cache_dir, "stage3_crohme.json")
+        
+        if not force_refresh and os.path.exists(cache_file):
             try:
-                extract_dir = os.path.join(self.data_dir, "crohme")
-                # This Zenodo ZIP contains thousands of .inkml files
-                zenodo_url = "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1"
-                self.downloader.download_zenodo_zip(zenodo_url, extract_dir)
-                
-                # The parser will automatically find .inkml and render .png files
-                samples = self.parser.parse_crohme(extract_dir)
-                
-                self._save_cache(samples, cache_file)
-                logger.info(f"Stage 3a (CROHME) complete: {len(samples)} samples")
-                return samples
+                samples = self._load_cache(cache_file)
+                if samples:
+                    logger.info(f"Loaded Stage 3 CROHME from cache: {len(samples)} samples")
+                    return samples
             except Exception as e:
-                logger.error(f"Could not load CROHME. Stage 3a will be empty. Error: {e}")
-                return []
+                logger.warning(f"Cache load failed, refreshing: {e}")
+        
+        try:
+            extract_dir = os.path.join(self.data_dir, "crohme")
+            zenodo_url = "https://zenodo.org/records/8428035/files/CROHME23.zip?download=1"
+            self.downloader.download_zenodo_zip(zenodo_url, extract_dir)
+            
+            samples = self.parser.parse_crohme(extract_dir)
+            
+            self._save_cache(samples, cache_file)
+            logger.info(f"Stage 3a (CROHME) complete: {len(samples)} samples")
+            return samples
+        except Exception as e:
+            logger.error(f"Could not load CROHME. Stage 3a will be empty. Error: {e}")
+            return []
  
-
     def get_stage3_hme100k(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         logger.info("Loading Stage 3b: HME100K (Messy Handwritten)")
         cache_file = os.path.join(self.cache_dir, "stage3_hme100k.json")
@@ -172,11 +166,9 @@ class DataManager:
         
         logger.info("Attempting to download HME100K from Kaggle mirror (prajwalchy/hme100k-dataset)...")
         try:
-            # Uses the KAGGLE_API_TOKEN from your environment/config
             self.downloader.download_kaggle("prajwalchy/hme100k-dataset", extract_dir)
             
             logger.info("Parsing HME100K dataset from Kaggle files...")
-            # Uses our new, ultra-robust parser that scans recursively for all images and labels
             samples = self.parser.parse_hme100k(extract_dir)
             
             if samples:
@@ -190,7 +182,6 @@ class DataManager:
         except Exception as e:
             logger.error(f"Could not load HME100K from Kaggle. Stage 3b will be empty. Error: {e}")
             return []
-
 
     def get_stage3_combined(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         crohme = self.get_stage3_crohme(force_refresh)
@@ -251,7 +242,12 @@ class DataManager:
     
     def _load_cache(self, cache_file: str) -> List[Dict[str, Any]]:
         with open(cache_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+            # FIX: Ensure we always return a list. If old buggy cache is loaded, return []
+            if isinstance(data, dict):
+                logger.warning(f"Found corrupted/dict cache in {cache_file}. Ignoring.")
+                return []
+            return data
     
     def _save_cache(self, samples: List[Dict[str, Any]], cache_file: str):
         try:
@@ -260,14 +256,10 @@ class DataManager:
                 if isinstance(s.get('image'), str) and os.path.exists(s.get('image', ''))
             ]
             
-            if not cacheable and samples:
-                cacheable = {"count": len(samples), "has_pil_images": True}
-            elif not cacheable:
-                cacheable = []
-            
+            # FIX: Never save a dict. Always save a list.
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cacheable, f, ensure_ascii=False)
-            logger.debug(f"Saved cache: {cache_file} ({len(cacheable) if isinstance(cacheable, list) else 1} items)")
+            logger.debug(f"Saved cache: {cache_file} ({len(cacheable)} items)")
         except Exception as e:
             logger.warning(f"Could not save cache: {e}")
     

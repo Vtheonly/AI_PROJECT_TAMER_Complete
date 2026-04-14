@@ -69,7 +69,7 @@ class LaTeXTokenizer:
                 tokens.append(latex[i])
                 i += 1
             
-            # FIX: Treat every digit and decimal point as a single, separate token
+            # Treat every digit and decimal point as a single, separate token
             # This prevents <unk> tokens for new numbers seen during inference.
             elif latex[i].isdigit() or latex[i] == '.':
                 tokens.append(latex[i])
@@ -106,7 +106,7 @@ class LaTeXTokenizer:
         return [self.vocab.get(t, self.unk_id) for t in tokens]
 
     def decode(self, indices: List[int], skip_special: bool = True) -> str:
-        """Convert a list of integer indices back to a LaTeX string."""
+        """Convert a list of integer indices back to a properly formatted LaTeX string."""
         res = []
         for idx in indices:
             # Ensure index is treated as int
@@ -118,7 +118,20 @@ class LaTeXTokenizer:
             if t == self.EOS_TOKEN:
                 break
             res.append(t)
-        return ' '.join(res)
+            
+        # FIX: Smart concatenation instead of naive ' '.join(res)
+        # Prevents \frac { a } { b } and correctly outputs \frac{a}{b}
+        out = ""
+        for i, token in enumerate(res):
+            out += token
+            # If this token is a LaTeX command (starts with \ and ends with a letter)
+            # and the NEXT token starts with a letter or number, we MUST add a space
+            # to prevent them from merging into an invalid command (e.g., \alpha + b -> \alphab)
+            if token.startswith('\\') and token[-1].isalpha():
+                if i + 1 < len(res) and res[i+1][0].isalnum():
+                    out += " "
+                    
+        return out
 
     def save(self, path: str):
         """Save vocabulary to a JSON file."""
@@ -136,10 +149,9 @@ class LaTeXTokenizer:
             data = json.load(f)
         
         self.vocab = data['vocab']
-        # Convert string keys from JSON back to integers for reverse lookup
-        self.reverse_vocab = {int(i) if str(i).isdigit() else i: t for t, i in self.vocab.items()}
-        # Re-map correctly where indices are the keys
-        self.reverse_vocab = {idx: tok for tok, idx in self.vocab.items()}
+        
+        # FIX: Cleaned up reverse mapping logic
+        self.reverse_vocab = {int(idx): tok for tok, idx in self.vocab.items()}
         
         # Integrity check for special tokens
         for token, expected_idx in zip(self.SPECIAL_TOKENS, range(4)):
