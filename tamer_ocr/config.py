@@ -131,7 +131,7 @@ class Config:
     #   +2 layers ≈ +5-8% compute, +2-4% ExpRate on multi-dataset OCR.
     #   The encoder is still the dominant cost; the decoder is cheap.
     # ----------------------------------------------------------------
-    encoder_name: str = "swin_v2_base_patch4_window8_256"
+    encoder_name: str = "swinv2_base_patch4_window8_256"
     encoder_feature_dim: int = 512      # Swin-v2-Base stage-2 output (for docs only)
     d_model: int = 512
     nhead: int = 8
