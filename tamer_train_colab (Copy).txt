@@ -1,221 +1,394 @@
-{
-  "nbformat": 4,
-  "nbformat_minor": 0,
-  "metadata": {
-    "kernelspec": {
-      "display_name": "Python 3",
-      "language": "python",
-      "name": "python3"
-    },
-    "language_info": {
-      "name": "python",
-      "version": "3.10.12",
-      "mimetype": "text/x-python",
-      "codemirror_mode": {
-        "name": "ipython",
-        "version": 3
-      },
-      "pygments_lexer": "ipython3",
-      "nbconvert_exporter": "python",
-      "file_extension": ".py"
-    },
-    "accelerator": "GPU",
-    "colab": {
-      "provenance": []
-    }
-  },
-  "cells": [
-    {
-      "cell_type": "markdown",
-      "metadata": {
-        "id": "l-QaSNoDpsJz"
-      },
-      "source": [
-        "# TAMER OCR v2.2 — Unified Execution Orchestrator\n",
-        "\n",
-        "**Fixed & Verified for Kaggle/Colab Compatibility:**\n",
-        "1. **Zero-Stale Purge:** Cleans workspace to prevent cache corruption.\n",
-        "2. **Secure Auth:** Handles HuggingFace and Kaggle credentials.\n",
-        "3. **Dependency Fix:** Installs `psutil` and latest `timm` for Swin-Base.\n",
-        "4. **Refactored Pipeline:** Uses the fixed `engine.py` logic for batched evaluation.\n",
-        "5. **Dynamic Scaling:** Automatically calculates OneCycleLR steps based on dataset size."
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "kbDKOtLEpsJ1"
-      },
-      "outputs": [],
-      "source": [
-        "import os\n",
-        "import shutil\n",
-        "import gc\n",
-        "import sys\n",
-        "\n",
-        "print(\"🧹 Cleaning workspace for a fresh start...\")\n",
-        "IS_KAGGLE = os.path.exists('/kaggle')\n",
-        "WORK_DIR = '/kaggle/working' if IS_KAGGLE else '/content'\n",
-        "os.chdir(WORK_DIR)\n",
-        "\n",
-        "# Directories to purge to ensure no stale data\n",
-        "directories = ['data', 'outputs', 'checkpoints', 'logs', 'AI_PROJECT_TAMER_Complete']\n",
-        "\n",
-        "for d in directories:\n",
-        "    path = os.path.join(WORK_DIR, d)\n",
-        "    if os.path.exists(path):\n",
-        "        shutil.rmtree(path, ignore_errors=True)\n",
-        "        print(f\"  - Removed: {path}\")\n",
-        "\n",
-        "gc.collect()\n",
-        "print(f\"✅ Workspace clean. Operating in: {WORK_DIR}\")"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "WIGQMM4spsJ3"
-      },
-      "outputs": [],
-      "source": [
-        "import getpass\n",
-        "import os\n",
-        "import json\n",
-        "\n",
-        "print(\"🔑 Configure credentials:\")\n",
-        "\n",
-        "# 1. Hugging Face Authentication\n",
-        "hf_token = os.getenv('HF_TOKEN') or getpass.getpass('HuggingFace Token (Write Access): ')\n",
-        "os.environ['HF_TOKEN'] = hf_token\n",
-        "\n",
-        "# 2. Kaggle Authentication\n",
-        "# Hardcoding username as requested\n",
-        "kaggle_user = \"merselfares\"\n",
-        "kaggle_key = getpass.getpass(f'Kaggle API Key for {kaggle_user}: ')\n",
-        "\n",
-        "os.environ['KAGGLE_USERNAME'] = kaggle_user\n",
-        "os.environ['KAGGLE_KEY'] = kaggle_key\n",
-        "\n",
-        "# Set up kaggle.json in the home directory for the kaggle-api CLI\n",
-        "kaggle_conf = os.path.expanduser('~/.kaggle')\n",
-        "os.makedirs(kaggle_conf, exist_ok=True)\n",
-        "\n",
-        "with open(os.path.join(kaggle_conf, 'kaggle.json'), 'w') as f:\n",
-        "    json.dump({\"username\": kaggle_user, \"key\": kaggle_key}, f)\n",
-        "\n",
-        "os.chmod(os.path.join(kaggle_conf, 'kaggle.json'), 0o600)\n",
-        "\n",
-        "print(f\"✅ Authentication configured for Kaggle user: {kaggle_user}\")"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "KUZfic0WpsJ3"
-      },
-      "outputs": [],
-      "source": [
-        "print(\"📦 Installing fixed dependencies...\")\n",
-        "# psutil is required for our fixed preprocessor memory logging\n",
-        "!pip install -q timm>=0.9.2 albumentations>=1.3.0 datasets huggingface_hub requests tqdm psutil opencv-python-headless\n",
-        "\n",
-        "print(\"\\n📥 Cloning production codebase...\")\n",
-        "REPO_URL = \"https://github.com/Vtheonly/AI_PROJECT_TAMER_Complete\"\n",
-        "!git clone {REPO_URL}\n",
-        "\n",
-        "print(\"✅ Environment ready.\")"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "EB1oTtHApsJ3"
-      },
-      "outputs": [],
-      "source": [
-        "from huggingface_hub import HfApi\n",
-        "\n",
-        "# Add cloned repo to system path\n",
-        "REPO_PATH = os.path.join(WORK_DIR, 'AI_PROJECT_TAMER_Complete')\n",
-        "if REPO_PATH not in sys.path: sys.path.insert(0, REPO_PATH)\n",
-        "\n",
-        "from tamer_ocr.config import Config\n",
-        "config = Config()\n",
-        "\n",
-        "# Map directories to writable environment paths\n",
-        "config.data_dir = os.path.join(WORK_DIR, 'data')\n",
-        "config.output_dir = os.path.join(WORK_DIR, 'outputs')\n",
-        "config.checkpoint_dir = os.path.join(WORK_DIR, 'checkpoints')\n",
-        "config.log_dir = os.path.join(WORK_DIR, 'logs')\n",
-        "\n",
-        "for d in [config.data_dir, config.output_dir, config.checkpoint_dir, config.log_dir]:\n",
-        "    os.makedirs(d, exist_ok=True)\n",
-        "\n",
-        "# Resolve Hugging Face Username for Repository IDs\n",
-        "api = HfApi(token=os.environ['HF_TOKEN'])\n",
-        "hf_user = api.whoami()['name']\n",
-        "config.hf_token = os.environ['HF_TOKEN']\n",
-        "config.hf_repo_id = f\"{hf_user}/tamer-ocr-model\"\n",
-        "config.hf_dataset_repo_id = f\"{hf_user}/tamer-preprocessed\"\n",
-        "\n",
-        "print(f\"✅ Configured for HF User: {hf_user}\")\n",
-        "print(f\"✅ Model Repo: {config.hf_repo_id}\")"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "GXqwR6mbpsJ4"
-      },
-      "outputs": [],
-      "source": [
-        "from tamer_ocr.core.trainer import Trainer\n",
-        "\n",
-        "print(\"🚀 Launching TAMER Core Training...\")\n",
-        "print(\"Order: 1. Preprocess -> 2. Build Model -> 3. Auto-Resume -> 4. Train\")\n",
-        "\n",
-        "trainer = Trainer(config)\n",
-        "\n",
-        "try:\n",
-        "    # trainer.run() handles the entire strict pipeline.\n",
-        "    # It now uses engine.py functions for batched, high-performance logic.\n",
-        "    trainer.run()\n",
-        "except Exception as e:\n",
-        "    print(f\"\\n❌ Pipeline execution failed: {e}\")\n",
-        "    import traceback\n",
-        "    traceback.print_exc()"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "trusted": true,
-        "id": "xqcxBIm_psJ4"
-      },
-      "outputs": [],
-      "source": [
-        "from tamer_ocr.utils.checkpoint import push_checkpoint_to_hf\n",
-        "\n",
-        "print(\"📤 Performing final artifact synchronization...\")\n",
-        "best_pt = os.path.join(config.checkpoint_dir, 'best.pt')\n",
-        "\n",
-        "if os.path.exists(best_pt):\n",
-        "    push_checkpoint_to_hf(best_pt, config, epoch=0, is_best=True)\n",
-        "    print(\"✅ Final best model successfully synced to HuggingFace Hub.\")\n",
-        "else:\n",
-        "    print(\"⚠️ No best.pt artifact found. Training may have been interrupted.\")"
-      ]
-    }
-  ]
-}
+ INFO:TAMER.Trainer:Device: cuda (AMP Enabled: True)
+INFO:TAMER.Trainer:GPU: Tesla T4
+INFO:TAMER.Trainer:VRAM: 15.6 GB
+INFO:TAMER.Trainer:======================================================================
+INFO:TAMER.Trainer:PHASE 1: Data Preprocessing (STRICT — no training until complete)
+INFO:TAMER.Trainer:======================================================================
+INFO:TAMER.Downloader:Hugging Face token configured
+INFO:TAMER.Downloader:Kaggle credentials configured
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:STEP 1: Downloading all datasets
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:Downloading crohme from URL (https://zenodo.org/records/8428035/files/CROHME23.zip?download=1)...
+🚀 Launching TAMER Core Training Pipeline...
+Pipeline Order:
+  1. Preprocess Datasets (or pull from HF)
+  2. Build Swin-Transformer Model
+  3. Auto-Resume Checkpoints
+  4. Train & Evaluate
+============================================================
+
+[Zenodo/URL] Downloading ZIP from https://zenodo.org/records/8428035/files/CROHME23.zip?download=1...
+  Downloaded: 10MB / 1733MB (0.6%)
+  Downloaded: 20MB / 1733MB (1.2%)
+  Downloaded: 30MB / 1733MB (1.7%)
+  Downloaded: 40MB / 1733MB (2.3%)
+  Downloaded: 50MB / 1733MB (2.9%)
+  Downloaded: 60MB / 1733MB (3.5%)
+  Downloaded: 70MB / 1733MB (4.0%)
+  Downloaded: 80MB / 1733MB (4.6%)
+  Downloaded: 90MB / 1733MB (5.2%)
+  Downloaded: 100MB / 1733MB (5.8%)
+  Downloaded: 110MB / 1733MB (6.3%)
+  Downloaded: 120MB / 1733MB (6.9%)
+  Downloaded: 130MB / 1733MB (7.5%)
+  Downloaded: 140MB / 1733MB (8.1%)
+  Downloaded: 150MB / 1733MB (8.7%)
+  Downloaded: 160MB / 1733MB (9.2%)
+  Downloaded: 170MB / 1733MB (9.8%)
+  Downloaded: 180MB / 1733MB (10.4%)
+  Downloaded: 190MB / 1733MB (11.0%)
+  Downloaded: 200MB / 1733MB (11.5%)
+  Downloaded: 210MB / 1733MB (12.1%)
+  Downloaded: 220MB / 1733MB (12.7%)
+  Downloaded: 230MB / 1733MB (13.3%)
+  Downloaded: 240MB / 1733MB (13.8%)
+  Downloaded: 250MB / 1733MB (14.4%)
+  Downloaded: 260MB / 1733MB (15.0%)
+  Downloaded: 270MB / 1733MB (15.6%)
+  Downloaded: 280MB / 1733MB (16.2%)
+  Downloaded: 290MB / 1733MB (16.7%)
+  Downloaded: 300MB / 1733MB (17.3%)
+  Downloaded: 310MB / 1733MB (17.9%)
+  Downloaded: 320MB / 1733MB (18.5%)
+  Downloaded: 330MB / 1733MB (19.0%)
+  Downloaded: 340MB / 1733MB (19.6%)
+  Downloaded: 350MB / 1733MB (20.2%)
+  Downloaded: 360MB / 1733MB (20.8%)
+  Downloaded: 370MB / 1733MB (21.3%)
+  Downloaded: 380MB / 1733MB (21.9%)
+  Downloaded: 390MB / 1733MB (22.5%)
+  Downloaded: 400MB / 1733MB (23.1%)
+  Downloaded: 410MB / 1733MB (23.7%)
+  Downloaded: 420MB / 1733MB (24.2%)
+  Downloaded: 430MB / 1733MB (24.8%)
+  Downloaded: 440MB / 1733MB (25.4%)
+  Downloaded: 450MB / 1733MB (26.0%)
+  Downloaded: 460MB / 1733MB (26.5%)
+  Downloaded: 470MB / 1733MB (27.1%)
+  Downloaded: 480MB / 1733MB (27.7%)
+  Downloaded: 490MB / 1733MB (28.3%)
+  Downloaded: 500MB / 1733MB (28.8%)
+  Downloaded: 510MB / 1733MB (29.4%)
+  Downloaded: 520MB / 1733MB (30.0%)
+  Downloaded: 530MB / 1733MB (30.6%)
+  Downloaded: 540MB / 1733MB (31.2%)
+  Downloaded: 550MB / 1733MB (31.7%)
+  Downloaded: 560MB / 1733MB (32.3%)
+  Downloaded: 570MB / 1733MB (32.9%)
+  Downloaded: 580MB / 1733MB (33.5%)
+  Downloaded: 590MB / 1733MB (34.0%)
+  Downloaded: 600MB / 1733MB (34.6%)
+  Downloaded: 610MB / 1733MB (35.2%)
+  Downloaded: 620MB / 1733MB (35.8%)
+  Downloaded: 630MB / 1733MB (36.3%)
+  Downloaded: 640MB / 1733MB (36.9%)
+  Downloaded: 650MB / 1733MB (37.5%)
+  Downloaded: 660MB / 1733MB (38.1%)
+  Downloaded: 670MB / 1733MB (38.7%)
+  Downloaded: 680MB / 1733MB (39.2%)
+  Downloaded: 690MB / 1733MB (39.8%)
+  Downloaded: 700MB / 1733MB (40.4%)
+  Downloaded: 710MB / 1733MB (41.0%)
+  Downloaded: 720MB / 1733MB (41.5%)
+  Downloaded: 730MB / 1733MB (42.1%)
+  Downloaded: 740MB / 1733MB (42.7%)
+  Downloaded: 750MB / 1733MB (43.3%)
+  Downloaded: 760MB / 1733MB (43.9%)
+  Downloaded: 770MB / 1733MB (44.4%)
+  Downloaded: 780MB / 1733MB (45.0%)
+  Downloaded: 790MB / 1733MB (45.6%)
+  Downloaded: 800MB / 1733MB (46.2%)
+  Downloaded: 810MB / 1733MB (46.7%)
+  Downloaded: 820MB / 1733MB (47.3%)
+  Downloaded: 830MB / 1733MB (47.9%)
+  Downloaded: 840MB / 1733MB (48.5%)
+  Downloaded: 850MB / 1733MB (49.0%)
+  Downloaded: 860MB / 1733MB (49.6%)
+  Downloaded: 870MB / 1733MB (50.2%)
+  Downloaded: 880MB / 1733MB (50.8%)
+  Downloaded: 890MB / 1733MB (51.4%)
+  Downloaded: 900MB / 1733MB (51.9%)
+  Downloaded: 910MB / 1733MB (52.5%)
+  Downloaded: 920MB / 1733MB (53.1%)
+  Downloaded: 930MB / 1733MB (53.7%)
+  Downloaded: 940MB / 1733MB (54.2%)
+  Downloaded: 950MB / 1733MB (54.8%)
+  Downloaded: 960MB / 1733MB (55.4%)
+  Downloaded: 970MB / 1733MB (56.0%)
+  Downloaded: 980MB / 1733MB (56.5%)
+  Downloaded: 990MB / 1733MB (57.1%)
+  Downloaded: 1000MB / 1733MB (57.7%)
+  Downloaded: 1010MB / 1733MB (58.3%)
+  Downloaded: 1020MB / 1733MB (58.9%)
+  Downloaded: 1030MB / 1733MB (59.4%)
+  Downloaded: 1040MB / 1733MB (60.0%)
+  Downloaded: 1050MB / 1733MB (60.6%)
+  Downloaded: 1060MB / 1733MB (61.2%)
+  Downloaded: 1070MB / 1733MB (61.7%)
+  Downloaded: 1080MB / 1733MB (62.3%)
+  Downloaded: 1090MB / 1733MB (62.9%)
+  Downloaded: 1100MB / 1733MB (63.5%)
+  Downloaded: 1110MB / 1733MB (64.0%)
+  Downloaded: 1120MB / 1733MB (64.6%)
+  Downloaded: 1130MB / 1733MB (65.2%)
+  Downloaded: 1140MB / 1733MB (65.8%)
+  Downloaded: 1150MB / 1733MB (66.4%)
+  Downloaded: 1160MB / 1733MB (66.9%)
+  Downloaded: 1170MB / 1733MB (67.5%)
+  Downloaded: 1180MB / 1733MB (68.1%)
+  Downloaded: 1190MB / 1733MB (68.7%)
+  Downloaded: 1200MB / 1733MB (69.2%)
+  Downloaded: 1210MB / 1733MB (69.8%)
+  Downloaded: 1220MB / 1733MB (70.4%)
+  Downloaded: 1230MB / 1733MB (71.0%)
+  Downloaded: 1240MB / 1733MB (71.5%)
+  Downloaded: 1250MB / 1733MB (72.1%)
+  Downloaded: 1260MB / 1733MB (72.7%)
+  Downloaded: 1270MB / 1733MB (73.3%)
+  Downloaded: 1280MB / 1733MB (73.9%)
+  Downloaded: 1290MB / 1733MB (74.4%)
+  Downloaded: 1300MB / 1733MB (75.0%)
+  Downloaded: 1310MB / 1733MB (75.6%)
+  Downloaded: 1320MB / 1733MB (76.2%)
+  Downloaded: 1330MB / 1733MB (76.7%)
+  Downloaded: 1340MB / 1733MB (77.3%)
+  Downloaded: 1350MB / 1733MB (77.9%)
+  Downloaded: 1360MB / 1733MB (78.5%)
+  Downloaded: 1370MB / 1733MB (79.0%)
+  Downloaded: 1380MB / 1733MB (79.6%)
+  Downloaded: 1390MB / 1733MB (80.2%)
+  Downloaded: 1400MB / 1733MB (80.8%)
+  Downloaded: 1410MB / 1733MB (81.4%)
+  Downloaded: 1420MB / 1733MB (81.9%)
+  Downloaded: 1430MB / 1733MB (82.5%)
+  Downloaded: 1440MB / 1733MB (83.1%)
+  Downloaded: 1450MB / 1733MB (83.7%)
+  Downloaded: 1460MB / 1733MB (84.2%)
+  Downloaded: 1470MB / 1733MB (84.8%)
+  Downloaded: 1480MB / 1733MB (85.4%)
+  Downloaded: 1490MB / 1733MB (86.0%)
+  Downloaded: 1500MB / 1733MB (86.5%)
+  Downloaded: 1510MB / 1733MB (87.1%)
+  Downloaded: 1520MB / 1733MB (87.7%)
+  Downloaded: 1530MB / 1733MB (88.3%)
+  Downloaded: 1540MB / 1733MB (88.9%)
+  Downloaded: 1550MB / 1733MB (89.4%)
+  Downloaded: 1560MB / 1733MB (90.0%)
+  Downloaded: 1570MB / 1733MB (90.6%)
+  Downloaded: 1580MB / 1733MB (91.2%)
+  Downloaded: 1590MB / 1733MB (91.7%)
+  Downloaded: 1600MB / 1733MB (92.3%)
+  Downloaded: 1610MB / 1733MB (92.9%)
+  Downloaded: 1620MB / 1733MB (93.5%)
+  Downloaded: 1630MB / 1733MB (94.0%)
+  Downloaded: 1640MB / 1733MB (94.6%)
+  Downloaded: 1650MB / 1733MB (95.2%)
+  Downloaded: 1660MB / 1733MB (95.8%)
+  Downloaded: 1670MB / 1733MB (96.4%)
+  Downloaded: 1680MB / 1733MB (96.9%)
+  Downloaded: 1690MB / 1733MB (97.5%)
+  Downloaded: 1700MB / 1733MB (98.1%)
+  Downloaded: 1710MB / 1733MB (98.7%)
+  Downloaded: 1720MB / 1733MB (99.2%)
+  Downloaded: 1730MB / 1733MB (99.8%)
+Download strictly completed: /kaggle/working/AI_PROJECT_TAMER_Complete/data/crohme/dataset.zip
+[Zenodo/URL] Download complete. Extracting ZIP to /kaggle/working/AI_PROJECT_TAMER_Complete/data/crohme...
+INFO:TAMER.Downloader:Extraction complete at /kaggle/working/AI_PROJECT_TAMER_Complete/data/crohme
+INFO:TAMER.Preprocessor:Downloading hme100k from Kaggle (prajwalchy/hme100k-dataset)...
+
+[Kaggle] Starting download for: prajwalchy/hme100k-dataset...
+INFO:TAMER.Downloader:Kaggle dataset downloaded and extracted to /kaggle/working/AI_PROJECT_TAMER_Complete/data/hme100k
+INFO:TAMER.Preprocessor:Downloading im2latex from Kaggle (shahrukhkhan/im2latex100k)...
+
+[Kaggle] Starting download for: shahrukhkhan/im2latex100k...
+INFO:TAMER.Downloader:Kaggle dataset downloaded and extracted to /kaggle/working/AI_PROJECT_TAMER_Complete/data/im2latex
+INFO:TAMER.Preprocessor:Downloading mathwriting from HF (deepcopy/MathWriting-human)...
+Note: Environment variable`HF_TOKEN` is set and is the current active token independently from the token you've just configured.
+WARNING:huggingface_hub._login:Note: Environment variable`HF_TOKEN` is set and is the current active token independently from the token you've just configured.
+INFO:TAMER.Downloader:Logged into Hugging Face with token
+
+[HuggingFace] Downloading dataset: deepcopy/MathWriting-human...
+/usr/local/lib/python3.12/dist-packages/huggingface_hub/utils/_auth.py:94: UserWarning: 
+The secret `HF_TOKEN` does not exist in your Colab secrets.
+To authenticate with the Hugging Face Hub, create a token in your settings tab (https://huggingface.co/settings/tokens), set it as secret in your Google Colab and restart your session.
+You will be able to reuse this secret in all of your notebooks.
+Please note that authentication is recommended but still optional to access public models or datasets.
+  warnings.warn(
+README.md:  3.27k/? [00:00<00:00, 230kB/s]data/train-00000-of-00003-ab0ae6b9fa4a3f(…): 100% 373M/373M [00:02<00:00, 298MB/s]data/train-00001-of-00003-589d2b65116e09(…): 100% 374M/374M [00:02<00:00, 300MB/s]data/train-00002-of-00003-42472859069c07(…): 100% 373M/373M [00:05<00:00, 543MB/s]data/test-00000-of-00001-694f317d8b63419(…): 100% 44.9M/44.9M [00:00<00:00, 224MB/s]data/val-00000-of-00001-184984e66f80ed7a(…): 100% 81.6M/81.6M [00:00<00:00, 404MB/s]Generating train split: 100% 229864/229864 [00:05<00:00, 41399.51 examples/s]Generating test split: 100% 7644/7644 [00:00<00:00, 30735.53 examples/s]Generating val split: 100% 15674/15674 [00:00<00:00, 34208.86 examples/s]INFO:TAMER.Downloader:Successfully loaded HF dataset: deepcopy/MathWriting-human (229864 samples)
+INFO:TAMER.Preprocessor:All datasets downloaded!
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:STEP 2: Preprocessing ALL datasets
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:
+--- Preprocessing: crohme ---
+INFO:TAMER.Preprocessor:  Memory (before crohme): 1581 MB
+INFO:TAMER.Parser:Parsing CROHME from /kaggle/working/AI_PROJECT_TAMER_Complete/data/crohme
+INFO:TAMER.Parser:Found 164287 .inkml files. Rendering to PNGs in parallel...
+INFO:TAMER.Parser:  Rendered 5000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 10000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 15000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 20000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 25000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 30000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 35000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 40000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 45000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 50000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 55000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 60000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 65000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 70000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 75000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 80000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 85000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 90000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 95000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 100000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 105000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 110000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 115000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 120000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 125000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 130000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 135000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 140000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 145000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 150000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 155000/164287 CROHME files...
+INFO:TAMER.Parser:  Rendered 160000/164287 CROHME files...
+INFO:TAMER.Parser:Successfully rendered 162558 CROHME images from InkML.
+INFO:TAMER.Normalizer:Normalized corpusx: 162558 kept, 0 discarded (0.0% filtered)
+INFO:TAMER.Preprocessor:crohme: 162558 valid samples
+INFO:TAMER.Preprocessor:  Memory (after crohme): 2164 MB
+INFO:TAMER.Preprocessor:
+--- Preprocessing: hme100k ---
+INFO:TAMER.Preprocessor:  Memory (before hme100k): 2164 MB
+INFO:TAMER.Parser:Parsing HME100K from /kaggle/working/AI_PROJECT_TAMER_Complete/data/hme100k
+INFO:TAMER.Parser:Matched 99109 HME100K samples.
+INFO:TAMER.Normalizer:Normalized corpusx: 99109 kept, 0 discarded (0.0% filtered)
+INFO:TAMER.Preprocessor:hme100k: 99107 valid samples
+INFO:TAMER.Preprocessor:  Memory (after hme100k): 2164 MB
+INFO:TAMER.Preprocessor:
+--- Preprocessing: im2latex ---
+INFO:TAMER.Preprocessor:  Memory (before im2latex): 2164 MB
+INFO:TAMER.Parser:Parsing Im2LaTeX from /kaggle/working/AI_PROJECT_TAMER_Complete/data/im2latex
+INFO:TAMER.Normalizer:Normalized corpusx: 7980 kept, 390 discarded (4.7% filtered)
+INFO:TAMER.Preprocessor:im2latex: 7978 valid samples
+INFO:TAMER.Preprocessor:  Memory (after im2latex): 2164 MB
+INFO:TAMER.Preprocessor:
+--- Preprocessing: mathwriting ---
+INFO:TAMER.Preprocessor:  Memory (before mathwriting): 2164 MB
+INFO:TAMER.Parser:Parsing Hugging Face dataset object. Max samples: All
+INFO:TAMER.Parser:HF dataset parsing complete: 229864 valid samples found.
+INFO:TAMER.Normalizer:Normalized corpusx: 208877 kept, 20987 discarded (9.1% filtered)
+INFO:TAMER.Preprocessor:mathwriting: 208877 valid samples
+INFO:TAMER.Preprocessor:  Memory (after mathwriting): 3217 MB
+INFO:TAMER.Preprocessor:Building global tokenizer...
+INFO:TAMER.Tokenizer:Building vocabulary from corpus...
+INFO:TAMER.Tokenizer:Vocabulary built: 466 total tokens.
+INFO:TAMER.Tokenizer:Tokenizer saved to /kaggle/working/AI_PROJECT_TAMER_Complete/data/processed/tokenizer.json (466 tokens)
+INFO:TAMER.Preprocessor:Tokenizer built and saved: 466 tokens
+INFO:TAMER.Preprocessor:
+All datasets preprocessed! Total: 478520 samples
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:STEP 3: Verifying dataset integrity
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:  crohme: 162558 samples — validation: OK
+INFO:TAMER.Preprocessor:  hme100k: 99107 samples — validation: OK
+INFO:TAMER.Preprocessor:  im2latex: 7978 samples — validation: OK
+INFO:TAMER.Preprocessor:  mathwriting: 208877 samples — validation: OK
+INFO:TAMER.Preprocessor:======================================================================
+INFO:TAMER.Preprocessor:STEP 4/5: Pushing processed dataset to HuggingFace
+INFO:TAMER.Preprocessor:======================================================================
+Processing Files (3 / 3)      : 100% 76.3MB / 76.3MB, 29.3MB/s  New Data Upload               : 100% 76.3MB / 76.3MB, 29.3MB/s    ...d/hf_upload/hme100k.jsonl: 100% 19.2MB / 19.2MB              ..._upload/mathwriting.jsonl: 100% 36.5MB / 36.5MB              ...ed/hf_upload/crohme.jsonl: 100% 20.5MB / 20.5MB            INFO:TAMER.Preprocessor:Successfully pushed dataset to: JJKK1212/tamer-preprocessed
+INFO:TAMER.Trainer:Total preprocessed samples: 478520
+INFO:TAMER.Trainer:After token length filter: 478520
+INFO:TAMER.Trainer:Train: 430667, Val: 47853
+INFO:TAMER.Trainer:Vocabulary size: 466
+INFO:TAMER.Tokenizer:Tokenizer saved to /kaggle/working/AI_PROJECT_TAMER_Complete/outputs/tokenizer.json (466 tokens)
+INFO:TAMER.Trainer:Creating data loaders...
+INFO:TAMER.Trainer:  crohme: 146302 samples (range 0-146302)
+INFO:TAMER.Trainer:  hme100k: 89196 samples (range 146302-235498)
+INFO:TAMER.Trainer:  im2latex: 7180 samples (range 235498-242678)
+INFO:TAMER.Trainer:  mathwriting: 187989 samples (range 242678-430667)
+/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/data/augmentation.py:14: UserWarning: Argument(s) 'mode, cval' are not valid for transform Affine
+  A.Affine(
+/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/data/augmentation.py:39: UserWarning: Argument(s) 'max_holes, max_height, max_width, min_holes, fill_value' are not valid for transform CoarseDropout
+  A.CoarseDropout(
+/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/data/augmentation.py:49: UserWarning: Argument(s) 'var_limit' are not valid for transform GaussNoise
+  A.GaussNoise(var_limit=(10.0, 30.0), p=0.2),
+INFO:TAMER.Trainer:Train dataset: 430667 samples, Val: 47853 samples
+INFO:TAMER.Trainer:======================================================================
+INFO:TAMER.Trainer:PHASE 2: Model Initialization
+INFO:TAMER.Trainer:======================================================================
+model.safetensors: 100% 353M/353M [00:06<00:00, 41.6MB/s]INFO:TAMER.Encoder:Gradient checkpointing ENABLED on Swin backbone
+INFO:TAMER.Encoder:Swin backbone feature_dim: 512
+INFO:TAMER.Trainer:Total parameters: 85,444,170
+INFO:TAMER.Trainer:Trainable parameters: 85,444,170
+INFO:TAMER.Trainer:Model size: ~0.34 GB (float32)
+INFO:TAMER.Trainer:Encoder LR: 1e-05, Decoder LR: 0.0001
+INFO:TAMER.Trainer:OneCycleLR: total_steps=2018850, pct_start=0.1
+INFO:TAMER.Trainer:Model initialization complete.
+INFO:TAMER.Trainer:No checkpoint found — starting from scratch
+INFO:TAMER.Trainer:======================================================================
+INFO:TAMER.Trainer:PHASE 3: Training Loop
+INFO:TAMER.Trainer:======================================================================
+INFO:TAMER.Trainer:Effective batch size: 32
+INFO:TAMER.Trainer:Num epochs: 150
+INFO:TAMER.Trainer:Checkpoint every 3 epochs
+INFO:TAMER.Trainer:
+======================================== Epoch 1/150 ========================================
+
+❌ Pipeline execution failed: mat1 and mat2 shapes cannot be multiplied (262144x16 and 512x512)
+Traceback (most recent call last):
+  File "/tmp/ipykernel_12019/2913217380.py", line 14, in <cell line: 0>
+    trainer.run()
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/core/trainer.py", line 583, in run
+    self.train()
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/core/trainer.py", line 358, in train
+    loss = train_step(
+           ^^^^^^^^^^^
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/core/engine.py", line 55, in train_step
+    logits = model(images, ids)
+             ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/models/tamer.py", line 54, in forward
+    memory = self.encode(images)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/models/tamer.py", line 40, in encode
+    return self.encoder(images)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/kaggle/working/AI_PROJECT_TAMER_Complete/tamer_ocr/models/encoder.py", line 76, in forward
+    features = self.proj(features)
+               ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (262144x16 and 512x512)
