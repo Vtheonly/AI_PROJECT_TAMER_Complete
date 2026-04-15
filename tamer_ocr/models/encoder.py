@@ -143,10 +143,21 @@ class SwinEncoder(nn.Module):
             W_feat = self.config.img_width // 32
             L = features.shape[1]
             if L != H_feat * W_feat:
-                # Adaptive fallback
-                aspect = self.config.img_width / self.config.img_height
-                H_feat = int((L / aspect) ** 0.5)
-                W_feat = L // H_feat
+                # FIX: Adaptive fallback MUST find an exact integer factorization of L
+                # Search for factors (h, w) where h*w == L and w/h is closest to aspect ratio
+                aspect = max(self.config.img_width / self.config.img_height, 1.0)
+                best_h, best_w = 1, L
+                min_diff = float('inf')
+                
+                for h in range(1, int(L**0.5) + 1):
+                    if L % h == 0:
+                        w = L // h
+                        diff = abs((w / h) - aspect)
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_h, best_w = h, w
+                            
+                H_feat, W_feat = best_h, best_w
             features = features.view(B, H_feat, W_feat, self.in_channels)
 
         H, W = features.shape[1], features.shape[2]

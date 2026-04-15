@@ -159,8 +159,8 @@ class StructureAwareLoss(nn.Module):
             reduction='none'
         )  # (B*L,)
 
-        # Apply structural weights
-        weights = self.token_weights[target_flat]  # (B*L,)
+        # Apply structural weights (ensure device match)
+        weights = self.token_weights.to(target_flat.device)[target_flat]  # (B*L,)
 
         # Mask out padding
         mask = (target_flat != self.pad_id).float()

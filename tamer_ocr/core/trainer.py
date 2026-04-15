@@ -223,13 +223,13 @@ class Trainer:
                 pad_id=self.tokenizer.pad_id,
                 label_smoothing=self.config.label_smoothing,
                 structural_weight=self.config.structural_token_weight,
-            )
+            ).to(self.device)
             self.logger.info("Using StructureAwareLoss")
         else:
             self.criterion = LabelSmoothedCELoss(
                 pad_id=self.tokenizer.pad_id,
                 label_smoothing=self.config.label_smoothing,
-            )
+            ).to(self.device)
             self.logger.info("Using LabelSmoothedCELoss")
 
         self.tokenizer.save(os.path.join(self.config.output_dir, "tokenizer.json"))
