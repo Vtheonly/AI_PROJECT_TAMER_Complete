@@ -12,11 +12,17 @@ def get_train_augmentation(height: int, width: int) -> A.Compose:
     return A.Compose([
         # Subtle geometric distortions
         A.ShiftScaleRotate(
-            scale_limit=0.05, 
-            shift_limit=0.02, 
-            rotate_limit=3, 
+            scale_limit=0.05,
+            shift_limit=0.02,
+            rotate_limit=3,
             border_mode=cv2.BORDER_CONSTANT,
             value=255, # Pad with white (cv2 convention for this transform)
+            p=0.5
+        ) if int(A.__version__.split('.')[0]) < 1 else A.Affine(
+            scale=(0.95, 1.05),
+            translate_percent={"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
+            rotate=(-3, 3),
+            cval=255,
             p=0.5
         ),
         
@@ -41,7 +47,7 @@ def get_train_augmentation(height: int, width: int) -> A.Compose:
             min_holes=1,
             fill_value=255, # Match white background
             p=0.2,
-        ) if int(albumentations.__version__.split('.')[0]) < 1 else A.CoarseDropout(
+        ) if int(A.__version__.split('.')[0]) < 1 else A.CoarseDropout(
             num_holes_range=(1, 4),
             hole_height_range=(1, int(height * 0.1)),
             hole_width_range=(1, int(width * 0.05)),
@@ -50,7 +56,7 @@ def get_train_augmentation(height: int, width: int) -> A.Compose:
         ),
         
         # Simulating digital sensor noise
-        A.GaussNoise(var_limit=(10.0, 30.0), p=0.2) if int(albumentations.__version__.split('.')[0]) < 1 else A.GaussianNoise(var_limit=(10.0, 30.0), p=0.2),
+        A.GaussNoise(var_limit=(10.0, 30.0), p=0.2) if int(A.__version__.split('.')[0]) < 1 else A.GaussianNoise(var_limit=(10.0, 30.0), p=0.2),
     ])
 
 def get_val_augmentation() -> A.Compose:
