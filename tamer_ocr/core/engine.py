@@ -227,4 +227,4 @@ def evaluate_full(
     metrics['val_loss'] = total_loss / max(num_batches, 1)
 
     model.train()
-    return metrics
+    return metrics, all_preds, all_targets

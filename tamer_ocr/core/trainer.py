@@ -1,24 +1,27 @@
 """
-Main Training Pipeline for TAMER OCR v2.2.
+Main Training Pipeline for TAMER OCR v2.3.
 
-Changes from v2.1:
-  - build_model(): Encoder freeze for the first config.freeze_encoder_epochs
-    epochs (default: 5). The decoder bootstraps on its own; encoder unfreezes
-    automatically at the right epoch with a log message confirming it.
-  - train(): Unfreeze logic injected at the top of the epoch loop — one clean
-    check, no extra state needed.
-  - Swin-v2 backbone is handled transparently: encoder.py reads channel counts
-    dynamically, so no changes are needed there.
+Changes from v2.2:
+  - Curriculum learning: progressively introduces harder samples.
+    Phase 1 (simple only) → Phase 2 (+aligned/cases) → Phase 3 (+matrices).
+    Controlled by config.curriculum_enabled and epoch thresholds.
+    DataLoaders are rebuilt when the curriculum stage advances.
 
-All v2.1 changes retained:
-  - DataLoaders: persistent_workers=True, prefetch_factor=2
-  - HuggingFace push: throttled to hf_push_every_n_epochs, background thread
-  - Evaluation: every config.eval_every epochs (default: 3)
-  - Evaluation: val set capped during eval_warmup_epochs
-  - evaluate_with_beam_search(): public method for --eval-only mode
-  - torch.compile(): optional, controlled by config.compile_model
-  - DataLoader profiler at training start
-  - Removed gc.collect() + cuda.empty_cache() from epoch loop
+  - Structure-aware loss: structural tokens (\\\\, &, \\begin{env}, \\end{env})
+    are weighted 3× in the loss. Controlled by config.structure_aware_loss.
+
+  - Structural accuracy metrics: evaluation now reports per-complexity
+    ExpRate (simple/medium/complex) and structural token recall.
+
+  - Normalizer no longer discards matrix/aligned/cases samples.
+    The total dataset is ~15-25% larger than v2.2.
+
+  - Tokenizer now handles \\\\, \\begin{env}, \\end{env} as atomic tokens.
+
+All v2.2 features retained:
+  - Encoder freeze/unfreeze, gradient checkpointing
+  - persistent_workers, prefetch_factor, HF push throttling
+  - eval_every, eval_warmup, torch.compile
 
 Strict pipeline order:
   1. Preprocess ALL datasets (via DatasetPreprocessor)
@@ -53,13 +56,15 @@ from ..data.sampler import (
 from ..data.preprocessor import DatasetPreprocessor
 from ..data.augmentation import get_train_augmentation, get_val_augmentation
 
-from .losses import LabelSmoothedCELoss
+from .losses import LabelSmoothedCELoss, StructureAwareLoss
 from .engine import train_step, optimizer_step, evaluate_full
 from ..utils.checkpoint import (
     save_checkpoint, load_checkpoint,
     find_latest_checkpoint, cleanup_old_checkpoints,
     push_checkpoint_to_hf,
 )
+from ..utils.metrics import evaluate_structural_accuracy
+from ..data.latex_normalizer import get_complexity
 from ..logger import setup_logger
 
 logger = logging.getLogger("TAMER.Trainer")
@@ -134,12 +139,16 @@ class Trainer:
         self.dataset_ranges: Dict = {}
         self.train_samples: List = []
         self.val_samples: List = []
+        self.all_train_samples: List = []  # Full unfiltered train set for curriculum
 
         self.step_start_time = time.time()
         self.epoch_start_time = time.time()
 
         # Track the last epoch we pushed to HF (prevents repeated pushes)
         self._last_hf_push_epoch: int = -1
+
+        # Curriculum learning state
+        self._current_curriculum_stage: str = 'simple'
 
     # ----------------------------------------------------------------
     # PHASE 1: Data Preprocessing
@@ -195,10 +204,33 @@ class Trainer:
         self.logger.info(f"Train: {len(self.train_samples)}, Val: {len(self.val_samples)}")
         self.logger.info(f"Vocabulary size: {len(self.tokenizer)}")
 
-        self.criterion = LabelSmoothedCELoss(
-            pad_id=self.tokenizer.pad_id,
-            label_smoothing=self.config.label_smoothing,
+        # Log complexity distribution
+        complexity_counts = {'simple': 0, 'medium': 0, 'complex': 0}
+        for s in self.train_samples:
+            complexity_counts[s.get('complexity', get_complexity(s.get('latex', '')))] += 1
+        self.logger.info(
+            f"  Train complexity: simple={complexity_counts['simple']}, "
+            f"medium={complexity_counts['medium']}, complex={complexity_counts['complex']}"
         )
+
+        # Store full train set for curriculum learning
+        self.all_train_samples = list(self.train_samples)
+
+        # Set up loss function (standard or structure-aware)
+        if self.config.structure_aware_loss:
+            self.criterion = StructureAwareLoss(
+                tokenizer=self.tokenizer,
+                pad_id=self.tokenizer.pad_id,
+                label_smoothing=self.config.label_smoothing,
+                structural_weight=self.config.structural_token_weight,
+            )
+            self.logger.info("Using StructureAwareLoss")
+        else:
+            self.criterion = LabelSmoothedCELoss(
+                pad_id=self.tokenizer.pad_id,
+                label_smoothing=self.config.label_smoothing,
+            )
+            self.logger.info("Using LabelSmoothedCELoss")
 
         self.tokenizer.save(os.path.join(self.config.output_dir, "tokenizer.json"))
 
@@ -420,6 +452,12 @@ class Trainer:
                 f"Encoder freeze: epochs 1-{self.config.freeze_encoder_epochs}, "
                 f"then full fine-tuning"
             )
+        if self.config.curriculum_enabled:
+            self.logger.info(
+                f"Curriculum: simple until epoch {self.config.curriculum_simple_until}, "
+                f"+medium until epoch {self.config.curriculum_medium_until}, "
+                f"then all data"
+            )
 
         # Profile the DataLoader before training starts.
         self._profile_dataloader()
@@ -433,9 +471,6 @@ class Trainer:
 
             # ----------------------------------------------------------------
             # Encoder Unfreeze
-            # At the start of epoch (freeze_encoder_epochs + 1), re-enable
-            # gradients for the encoder. The optimizer already tracks its
-            # params, so no rebuild is needed — just flip requires_grad.
             # ----------------------------------------------------------------
             if (self.config.freeze_encoder_epochs > 0 and
                     self.current_epoch == self.config.freeze_encoder_epochs + 1):
@@ -449,6 +484,21 @@ class Trainer:
                     f"{newly_trainable:,} encoder params now training at "
                     f"LR={self.config.encoder_lr:.1e} ***"
                 )
+
+            # ----------------------------------------------------------------
+            # Curriculum Learning
+            # Advance to harder data when epoch thresholds are crossed.
+            # Rebuilds the dataloader with the new filtered sample set.
+            # ----------------------------------------------------------------
+            if self.config.curriculum_enabled:
+                new_stage = self._get_curriculum_stage(self.current_epoch)
+                if new_stage != self._current_curriculum_stage:
+                    self.logger.info(
+                        f"*** Curriculum advance: {self._current_curriculum_stage} → {new_stage} ***"
+                    )
+                    self._current_curriculum_stage = new_stage
+                    # Rebuild train dataloader with new samples
+                    self._rebuild_train_loader_for_curriculum(new_stage)
 
             self.epoch_start_time = time.time()
             epoch_loss = 0.0
@@ -596,7 +646,7 @@ class Trainer:
             f"Evaluating{sample_desc} (beam={use_beam_search})..."
         )
 
-        metrics = evaluate_full(
+        metrics, all_preds, all_targets = evaluate_full(
             model=self.model,
             dataloader=self.val_loader,
             criterion=self.criterion,
@@ -616,6 +666,28 @@ class Trainer:
             f"SER: {metrics['ser']:.4f} | "
             f"Leq1: {metrics['leq1']:.4f}"
         )
+
+        # Structural accuracy breakdown (per-complexity + structural token recall)
+        try:
+            struct_metrics = evaluate_structural_accuracy(
+                all_preds, all_targets
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to compute structural metrics: {e}")
+            struct_metrics = {}
+
+        if struct_metrics:
+            self.logger.info(
+                f"  STRUCT | "
+                f"simple={struct_metrics.get('exprate_simple', 0):.3f} "
+                f"({struct_metrics.get('count_simple', 0)}) | "
+                f"medium={struct_metrics.get('exprate_medium', 0):.3f} "
+                f"({struct_metrics.get('count_medium', 0)}) | "
+                f"complex={struct_metrics.get('exprate_complex', 0):.3f} "
+                f"({struct_metrics.get('count_complex', 0)}) | "
+                f"struct_recall={struct_metrics.get('structural_token_recall', 0):.3f}"
+            )
+            metrics.update(struct_metrics)
 
         # Early stopping on edit distance (lower is better).
         is_best = metrics['edit_dist'] < self.best_edit_dist
@@ -652,6 +724,70 @@ class Trainer:
         """
         metrics, _ = self._evaluate(use_beam_search=True, max_samples=max_samples)
         return metrics
+
+    # ----------------------------------------------------------------
+    # Curriculum Learning
+    # ----------------------------------------------------------------
+
+    def _get_curriculum_stage(self, epoch: int) -> str:
+        """Return the curriculum stage based on the current epoch."""
+        if not self.config.curriculum_enabled:
+            return 'complex' # all data
+        if epoch <= self.config.curriculum_simple_until:
+            return 'simple'
+        if epoch <= self.config.curriculum_medium_until:
+            return 'medium'
+        return 'complex'
+
+    def _rebuild_train_loader_for_curriculum(self, stage: str):
+        """Rebuild the train dataloader with samples up to the given complexity stage."""
+        if stage == 'simple':
+            allowed = {'simple'}
+        elif stage == 'medium':
+            allowed = {'simple', 'medium'}
+        else: # complex
+            allowed = {'simple', 'medium', 'complex'}
+
+        filtered_samples = []
+        for s in self.all_train_samples:
+            complexity = s.get('complexity', get_complexity(s.get('latex', '')))
+            if complexity in allowed:
+                filtered_samples.append(s)
+
+        self.logger.info(
+            f"Curriculum stage {stage}: {len(filtered_samples)} / {len(self.all_train_samples)} "
+            f"train samples available."
+        )
+
+        self.train_samples = filtered_samples
+        self._compute_dataset_ranges(self.train_samples)
+
+        train_transform = get_train_augmentation(self.config.img_height, self.config.img_width)
+        
+        self.train_dataset = MathDataset(
+            samples=self.train_samples,
+            config=self.config,
+            tokenizer=self.tokenizer,
+            transform=train_transform,
+        )
+
+        collate_fn = get_collate_fn(self.tokenizer.pad_id)
+
+        batch_sampler = MultiDatasetBatchSampler(
+            dataset=self.train_dataset,
+            dataset_ranges=self.dataset_ranges,
+            batch_size=self.config.batch_size,
+        )
+
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
 
     # ----------------------------------------------------------------
     # Checkpointing

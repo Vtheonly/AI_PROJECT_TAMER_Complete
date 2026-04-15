@@ -11,6 +11,7 @@ from pathlib import Path
 from .downloader import AdvDatasetDownloader
 from .advanced_downloader import AdvDownloader
 from .parser import DatasetParser
+from .preprocessor import _make_relative, _resolve_path
 
 logger = logging.getLogger("TAMER.DataManager")
 
@@ -247,19 +248,33 @@ class DataManager:
             if isinstance(data, dict):
                 logger.warning(f"Found corrupted/dict cache in {cache_file}. Ignoring.")
                 return []
+            
+            # FIX: Resolve all image paths against current data_dir
+            for s in data:
+                img = s.get('image') or s.get('image_path', '')
+                if isinstance(img, str) and img:
+                    resolved = _resolve_path(img, self.data_dir)
+                    s['image'] = resolved
+                    s.pop('image_path', None)
+            
             return data
     
     def _save_cache(self, samples: List[Dict[str, Any]], cache_file: str):
         try:
-            cacheable = [
-                s for s in samples 
-                if isinstance(s.get('image'), str) and os.path.exists(s.get('image', ''))
-            ]
+            cacheable = []
+            for s in samples:
+                img = s.get('image', '')
+                if isinstance(img, str) and os.path.exists(img):
+                    s2 = dict(s)
+                    # FIX: Store RELATIVE paths so cache works across environments
+                    s2['image'] = _make_relative(img, self.data_dir)
+                    s2.pop('image_path', None)
+                    cacheable.append(s2)
             
             # FIX: Never save a dict. Always save a list.
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cacheable, f, ensure_ascii=False)
-            logger.debug(f"Saved cache: {cache_file} ({len(cacheable)} items)")
+            logger.debug(f"Saved cache: {cache_file} ({len(cacheable)} items, relative paths)")
         except Exception as e:
             logger.warning(f"Could not save cache: {e}")
     

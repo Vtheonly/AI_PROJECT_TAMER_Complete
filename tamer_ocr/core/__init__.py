@@ -8,6 +8,7 @@ def __getattr__(name):
     _LAZY_IMPORTS = {
         'Trainer': '.trainer',
         'LabelSmoothedCELoss': '.losses',
+        'StructureAwareLoss': '.losses',
         'beam_search': '.inference',
         'greedy_decode': '.inference',
     }

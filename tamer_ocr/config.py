@@ -1,32 +1,32 @@
 """
-TAMER OCR v2.2 — Configuration
+TAMER OCR v2.3 — Configuration
 
-Changes from v2.1:
-  - encoder_name switched to swin_v2_base_patch4_window8_256.
-      Swin-v2 uses log-spaced continuous relative position bias, which
-      generalises better to rectangular (non-square) images and to
-      resolutions different from the pre-training resolution. Drop-in
-      replacement for Swin-Base: same channel widths, same timm API,
-      no change to encoder.py required.
+Changes from v2.2:
+  - Added balanced_mode (192×768): a middle ground between fast_mode
+    (128×512) and full resolution (256×1024). Provides 576 encoder
+    patches with 6 vertical rows — enough for most matrices while
+    being ~2× faster than full mode.
 
-  - num_decoder_layers raised from 6 → 8.
-      Decoder is cheap relative to the encoder. +2 layers ≈ +5-8% wall
-      time per step, but the extra cross-attention capacity reliably
-      improves ExpRate by 2-4% on multi-dataset OCR.
+  - Added curriculum learning support: the trainer progressively
+    introduces harder samples (simple → medium → complex).
+    Controlled by curriculum_enabled, curriculum_simple_until,
+    and curriculum_medium_until.
 
-  - freeze_encoder_epochs = 5 (new).
-      Encoder weights are frozen for the first N epochs so the randomly-
-      initialised decoder can bootstrap without destabilising the
-      pre-trained features. Unfreeze happens automatically in the trainer.
-      Effect: faster early loss drop, more stable final convergence.
+  - Added structure_aware_loss: weights structural tokens (\\\\, &,
+    \\begin, \\end) 3× higher in the loss. Getting row/column
+    separators wrong destroys entire matrix structure.
 
-  - num_epochs reduced from 150 → 70.
-      With the better encoder and decoder, the model converges sooner.
-      70 epochs × ~75 min/epoch (worst-case on Kaggle T4) = ~87 hours,
-      safely under the 100-hour budget. Early stopping (patience=20)
-      will almost always terminate well before epoch 70.
+  - Encoder now uses strong 2D positional encoding (learned row/col
+    embeddings) with row boundary markers. No config changes needed.
 
-  - All other settings from v2.1 are unchanged.
+  - Tokenizer now handles \\\\, \\begin{env}, \\end{env} as atomic
+    tokens. Normalizer no longer discards matrices/aligned/cases.
+
+Retained from v2.2:
+  - encoder_name: swinv2_base_window8_256.ms_in1k
+  - num_decoder_layers: 10, freeze_encoder_epochs: 5
+  - num_epochs: 70, early_stopping_patience: 20
+  - All other training parameters unchanged.
 """
 
 import os
@@ -90,16 +90,23 @@ class Config:
     #
     # PERFORMANCE NOTE:
     #   256x1024 (default) — best quality, but slow.
-    #   swin_v2_base produces 16x64 = 1024 patches at this resolution.
-    #   Each forward pass is expensive.
+    #   swin_v2_base produces 8x32 = 256 patches (fast), 6x24 = 144
+    #   patches (balanced), or 8x32 = 256 patches at this resolution.
     #
-    #   FAST MODE: set fast_mode=True → uses 128x512 (4 patches).
-    #   Roughly 4x faster per step, ~3-5% accuracy drop. Good for
-    #   early experiments or if your epoch time is > 90 min.
+    #   FAST MODE: set fast_mode=True → uses 128x512.
+    #   Roughly 4x faster per step, ~3-5% accuracy drop on single-line,
+    #   ~15-25% drop on multi-line (only 4 vertical patch rows).
+    #
+    #   BALANCED MODE: set balanced_mode=True → uses 192x768.
+    #   Roughly 2x faster than full, 6 vertical patch rows — enough
+    #   for most matrices. Best tradeoff for multi-line support.
+    #
+    #   Priority: fast_mode > balanced_mode > default
     # ----------------------------------------------------------------
     img_height: int = 256
     img_width: int = 1024
     fast_mode: bool = False          # If True, overrides resolution to 128x512
+    balanced_mode: bool = False      # If True, overrides resolution to 192x768
 
     # ----------------------------------------------------------------
     # Data Filtering
@@ -178,6 +185,30 @@ class Config:
     freeze_encoder_epochs: int = 5
 
     # ----------------------------------------------------------------
+    # Curriculum Learning (NEW)
+    #
+    # Progressively introduce harder samples:
+    #   Phase 1 (epochs 1 to simple_until):  single-line formulas only
+    #   Phase 2 (simple_until to medium_until): + aligned, cases
+    #   Phase 3 (medium_until onward):        + matrices, arrays
+    #
+    # Set curriculum_enabled=False to train on all data from epoch 1.
+    # ----------------------------------------------------------------
+    curriculum_enabled: bool = True
+    curriculum_simple_until: int = 15
+    curriculum_medium_until: int = 35
+
+    # ----------------------------------------------------------------
+    # Structure-Aware Loss (NEW)
+    #
+    # Weights structural tokens (\\, &, \begin{}, \end{}) higher
+    # in the loss. Getting these wrong destroys matrix structure.
+    # Set to False to use standard label-smoothed CE only.
+    # ----------------------------------------------------------------
+    structure_aware_loss: bool = True
+    structural_token_weight: float = 3.0
+
+    # ----------------------------------------------------------------
     # Dynamic Temperature Sampling
     # ----------------------------------------------------------------
     temp_start: float = 0.8
@@ -239,10 +270,13 @@ class Config:
     total_training_steps: int = 0
 
     def __post_init__(self):
-        # Apply fast_mode resolution override
+        # Apply resolution override (fast_mode takes priority)
         if self.fast_mode:
             self.img_height = 128
             self.img_width = 512
+        elif self.balanced_mode:
+            self.img_height = 192
+            self.img_width = 768
 
         # Create all required directories
         for path in [self.data_dir, self.output_dir, self.checkpoint_dir, self.log_dir]:

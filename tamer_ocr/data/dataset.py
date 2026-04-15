@@ -46,18 +46,23 @@ class MathDataset(Dataset):
     def _process_image(self, img_source: Union[str, Image.Image]) -> torch.Tensor:
         """
         Process an image with aspect-ratio-preserving resizing.
-        
-        Rules:
-        1. Resize so height = 256, maintaining aspect ratio.
-        2. If resulting width < 1024, pad with white (255) to 1024.
-        3. If resulting width > 1024, resize width to 1024, then pad height to 256.
-        4. Normalize using ImageNet mean/std across 3 channels.
-        
+
+        v2.3: Adaptive handling for tall (multi-line/matrix) vs wide (single-line) images.
+
+        For WIDE images (aspect >= 2.0, typical single-line formulas):
+          1. Scale height to target_h, pad width to target_w.
+          2. If width overflows, scale to fit width and center vertically.
+
+        For TALL images (aspect < 2.0, multi-line equations/matrices):
+          1. Scale to fit BOTH dimensions (no cropping).
+          2. Center the image both horizontally AND vertically.
+          This preserves vertical row structure instead of squashing it.
+
         Returns:
-            Tensor of shape (3, 256, 1024)
+            Tensor of shape (3, H, W) with ImageNet normalization.
         """
-        target_h = self.config.img_height   # 256
-        target_w = self.config.img_width    # 1024
+        target_h = self.config.img_height
+        target_w = self.config.img_width
 
         # Load image
         if isinstance(img_source, str):
@@ -67,8 +72,7 @@ class MathDataset(Dataset):
         else:
             raise ValueError(f"Unsupported image type: {type(img_source)}")
 
-        # FIX: Convert to true RGB to match Swin pretraining!
-        # Do NOT use 'L' (grayscale) and expand, as it breaks ImageNet normalization.
+        # Convert to true RGB to match Swin pretraining
         img = img.convert('RGB')
         arr = np.array(img)
 
@@ -76,30 +80,50 @@ class MathDataset(Dataset):
         if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
             canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
         else:
-            h, w, c = arr.shape
-            
-            # Aspect ratio filter (optional based on config)
-            aspect = max(w, h) / max(min(w, h), 1)
-            if aspect > self.config.max_aspect_ratio:
+            h, w = arr.shape[:2]
+
+            # Aspect ratio filter
+            aspect_ratio = max(w, h) / max(min(w, h), 1)
+            if aspect_ratio > self.config.max_aspect_ratio:
                 canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
             else:
-                # Step 1: Scale height to target_h
-                scale = target_h / h
-                new_w = int(w * scale)
+                img_aspect = w / max(h, 1)
 
-                if new_w > target_w:
-                    # Step 2: If width exceeds target, scale width instead
-                    scale = target_w / w
-                    new_h = int(h * scale)
-                    arr = cv2.resize(arr, (target_w, new_h), interpolation=cv2.INTER_AREA)
+                if img_aspect < 2.0:
+                    # TALL image (multi-line equations, matrices)
+                    # Scale to fit within target dimensions without cropping
+                    scale_h = target_h / h
+                    scale_w = target_w / w
+                    scale = min(scale_h, scale_w)  # fit whichever is tighter
+
+                    new_h = min(int(h * scale), target_h)
+                    new_w = min(int(w * scale), target_w)
+
+                    arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
                     canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-                    y_offset = (target_h - new_h) // 2
-                    canvas[y_offset:y_offset+new_h, :, :] = arr
+
+                    # Center both vertically AND horizontally
+                    y_off = (target_h - new_h) // 2
+                    x_off = (target_w - new_w) // 2
+                    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = arr
                 else:
-                    # Resize height to target_h, pad width
-                    arr = cv2.resize(arr, (new_w, target_h), interpolation=cv2.INTER_AREA)
-                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-                    canvas[:, :new_w, :] = arr
+                    # WIDE image (single-line formulas — existing logic)
+                    scale = target_h / h
+                    new_w = int(w * scale)
+
+                    if new_w > target_w:
+                        # Width overflows: scale to fit width, center vertically
+                        scale = target_w / w
+                        new_h = int(h * scale)
+                        arr = cv2.resize(arr, (target_w, new_h), interpolation=cv2.INTER_AREA)
+                        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                        y_offset = (target_h - new_h) // 2
+                        canvas[y_offset:y_offset + new_h, :, :] = arr
+                    else:
+                        # Normal case: scale height, pad width on right
+                        arr = cv2.resize(arr, (new_w, target_h), interpolation=cv2.INTER_AREA)
+                        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                        canvas[:, :new_w, :] = arr
 
         # Apply augmentation if provided (e.g., rotation, noise)
         if self.transform:
