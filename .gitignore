@@ -66,3 +66,6 @@ error.txt
 *.token
 *.key
 .env*
+tamer_train_colab_prime.ipynb
+
+*.ipynb

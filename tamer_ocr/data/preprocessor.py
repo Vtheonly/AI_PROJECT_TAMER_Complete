@@ -173,15 +173,18 @@ class DatasetPreprocessor:
     # ============================================================
 
     def run_full_pipeline(self) -> Tuple[Dict[str, List[Dict]], LaTeXTokenizer]:
-        """Main entry point: Pull from cloud OR Process locally."""
-        
-        # 1. Try to download already-processed images from the cloud
         if self.pull_from_huggingface():
             all_processed = {}
-            # Search for the .jsonl metadata files we just extracted
             for jsonl in Path(self.processed_dir).glob("*.jsonl"):
-                all_processed[jsonl.stem] = self._load_jsonl(str(jsonl))
+                raw = self._load_jsonl(str(jsonl))
+                # Re-expand relative paths to absolute using current data_dir
+                for s in raw:
+                    img = s.get('image') or s.get('image_path')
+                    if isinstance(img, str) and not os.path.isabs(img):
+                        s['image'] = os.path.join(self.data_dir, img)
+                all_processed[jsonl.stem] = raw
             return all_processed, self.tokenizer
+        # ... rest unchanged
 
         # 2. Local fallback: If no cloud ZIP, we must download and render everything
         dataset_sources = self.download_all_datasets()
@@ -295,4 +298,16 @@ class DatasetPreprocessor:
 
     def _save_processed_cache(self, dataset_name: str, samples: List[Dict]):
         path = os.path.join(self.processed_dir, f"{dataset_name}.jsonl")
-        self._save_jsonl(samples, path)
+        rel_samples = []
+        for s in samples:
+            s2 = dict(s)
+            img = s2.get('image') or s2.get('image_path')
+            if isinstance(img, str) and os.path.isabs(img):
+                try:
+                    # Store path relative to data_dir — portable across environments
+                    s2['image'] = os.path.relpath(img, self.data_dir)
+                    s2.pop('image_path', None)
+                except ValueError:
+                    pass  # Windows cross-drive edge case
+            rel_samples.append(s2)
+        self._save_jsonl(rel_samples, path)    
