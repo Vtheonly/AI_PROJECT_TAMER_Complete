@@ -18,6 +18,10 @@ Changes from v2.2:
 
   - Tokenizer now handles \\\\, \\begin{env}, \\end{env} as atomic tokens.
 
+  - H100 optimizations: val DataLoader uses batch_size // 2 to prevent
+    OOM during evaluation at large batch sizes. TF32 flags and
+    torch.compile are set in train.py at process startup.
+
 All v2.2 features retained:
   - Encoder freeze/unfreeze, gradient checkpointing
   - persistent_workers, prefetch_factor, HF push throttling
@@ -75,11 +79,26 @@ logger = logging.getLogger("TAMER.Trainer")
 # Runs in a daemon thread so the training loop never blocks on a network call.
 # ---------------------------------------------------------------------------
 
-def _push_hf_background(checkpoint_path: str, config: Config, epoch: int, is_best: bool):
-    """Push a checkpoint to HuggingFace in a background thread."""
+def _push_hf_background(
+    checkpoint_path: str,
+    config: Config,
+    epoch: int,
+    is_best: bool,
+) -> threading.Thread:
+    """
+    Push a checkpoint to HuggingFace Hub in a background daemon thread.
+
+    Using a daemon thread means:
+      - Training is never blocked by network latency.
+      - If the main process exits (e.g. training finishes), the push
+        thread is killed automatically — no zombie processes.
+      - Failures are logged as warnings, not exceptions, so training
+        continues uninterrupted even if HF is temporarily unreachable.
+    """
     def _worker():
         try:
             push_checkpoint_to_hf(checkpoint_path, config, epoch, is_best=is_best)
+            logger.info(f"HF push complete (epoch {epoch}, best={is_best})")
         except Exception as e:
             logger.warning(f"Background HF push failed (epoch {epoch}): {e}")
 
@@ -91,6 +110,14 @@ def _push_hf_background(checkpoint_path: str, config: Config, epoch: int, is_bes
 class Trainer:
     """
     Orchestrates the full TAMER OCR training pipeline.
+
+    Pipeline stages (called in order by run()):
+      1. preprocess_data()     — download, parse, normalise, split
+      2. create_dataloaders()  — build Dataset + DataLoader objects
+      3. build_model()         — init model, optimiser, scheduler
+      4. _auto_resume()        — load latest checkpoint if present
+      5. train()               — main epoch loop
+      6. _evaluate(beam=True)  — final beam-search evaluation
     """
 
     def __init__(self, config: Config):
@@ -104,11 +131,17 @@ class Trainer:
         if torch.cuda.is_available():
             self.logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
             props = torch.cuda.get_device_properties(0)
-            vram_gb = getattr(props, 'total_memory', 0) / 1e9
+            vram_gb = props.total_memory / 1e9
             self.logger.info(f"VRAM: {vram_gb:.1f} GB")
             self.logger.info(
-                f"Image resolution: {config.img_height}x{config.img_width} "
-                f"→ {(config.img_height // 4) * (config.img_width // 4):,} patches per image"
+                f"Image resolution: {config.img_height}×{config.img_width} "
+                f"→ {(config.img_height // 4) * (config.img_width // 4):,} "
+                f"patches per image"
+            )
+            # Log TF32 status so users can verify the flags are active
+            self.logger.info(
+                f"TF32 matmul: {torch.backends.cuda.matmul.allow_tf32} | "
+                f"cuDNN benchmark: {torch.backends.cudnn.benchmark}"
             )
 
         self.tokenizer = LaTeXTokenizer()
@@ -118,19 +151,21 @@ class Trainer:
         self.scheduler = None
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
+        # Placeholder criterion — replaced after tokenizer is built in
+        # preprocess_data() once we know the vocabulary and pad_id.
         self.criterion = LabelSmoothedCELoss(
             pad_id=0,
             label_smoothing=config.label_smoothing,
         )
 
-        # Training state
+        # ── Training State ─────────────────────────────────────────
         self.current_epoch = 0
         self.global_step = 0
         self.best_exp_rate = 0.0
         self.best_edit_dist = float('inf')
         self.epochs_without_improvement = 0
 
-        # Data
+        # ── Data ───────────────────────────────────────────────────
         self.train_dataset = None
         self.val_dataset = None
         self.train_loader = None
@@ -141,13 +176,15 @@ class Trainer:
         self.val_samples: List = []
         self.all_train_samples: List = []  # Full unfiltered train set for curriculum
 
+        # ── Timing ─────────────────────────────────────────────────
         self.step_start_time = time.time()
         self.epoch_start_time = time.time()
 
-        # Track the last epoch we pushed to HF (prevents repeated pushes)
+        # ── HF Push Throttle ───────────────────────────────────────
+        # Track the last epoch we pushed to HF to prevent repeated pushes.
         self._last_hf_push_epoch: int = -1
 
-        # Curriculum learning state
+        # ── Curriculum State ───────────────────────────────────────
         self._current_curriculum_stage: str = 'simple'
 
     # ----------------------------------------------------------------
@@ -155,7 +192,20 @@ class Trainer:
     # ----------------------------------------------------------------
 
     def preprocess_data(self):
-        """Run the full preprocessing pipeline."""
+        """
+        Run the full preprocessing pipeline via DatasetPreprocessor.
+
+        Steps performed here:
+          1. Download / locate raw datasets
+          2. Parse each dataset into (image_path, latex) pairs
+          3. Normalise LaTeX strings
+          4. Build / extend the tokenizer vocabulary
+          5. Filter by token length
+          6. Stratified 90/10 train/val split per dataset
+          7. Annotate each sample with its complexity bucket
+          8. Instantiate the appropriate loss function
+          9. Save the tokenizer to disk
+        """
         self.logger.info("=" * 70)
         self.logger.info("PHASE 1: Data Preprocessing")
         self.logger.info("=" * 70)
@@ -169,7 +219,7 @@ class Trainer:
 
         self.logger.info(f"Total preprocessed samples: {len(all_samples)}")
 
-        # Filter by token length
+        # ── Token Length Filter ────────────────────────────────────
         filtered = []
         for s in all_samples:
             latex = s.get('latex', '')
@@ -179,9 +229,14 @@ class Trainer:
             if len(tokens) <= self.config.max_token_length:
                 filtered.append(s)
 
-        self.logger.info(f"After token length filter: {len(filtered)}")
+        self.logger.info(
+            f"After token length filter (≤{self.config.max_token_length}): "
+            f"{len(filtered)} samples"
+        )
 
-        # Stratified split per dataset to maintain distribution
+        # ── Stratified Train / Val Split ───────────────────────────
+        # Group by dataset name so each source gets its own 90/10 split.
+        # This prevents any single large dataset from dominating the val set.
         grouped: Dict[str, List] = {}
         for s in filtered:
             ds = s.get('dataset_name', 'unknown')
@@ -194,29 +249,41 @@ class Trainer:
         for ds, ds_samples in grouped.items():
             rng.shuffle(ds_samples)
             split_idx = int(len(ds_samples) * 0.9)
-            self.train_samples.extend(ds_samples[:split_idx])
-            self.val_samples.extend(ds_samples[split_idx:])
+            train_part = ds_samples[:split_idx]
+            val_part = ds_samples[split_idx:]
+            self.train_samples.extend(train_part)
+            self.val_samples.extend(val_part)
+            self.logger.info(
+                f"  {ds}: {len(train_part)} train, {len(val_part)} val"
+            )
 
-        # Sort by dataset_name so MultiDatasetBatchSampler gets contiguous ranges
+        # Sort by dataset_name so MultiDatasetBatchSampler gets contiguous ranges.
         self.train_samples.sort(key=lambda x: x.get('dataset_name', 'unknown'))
         self.val_samples.sort(key=lambda x: x.get('dataset_name', 'unknown'))
 
-        self.logger.info(f"Train: {len(self.train_samples)}, Val: {len(self.val_samples)}")
+        self.logger.info(
+            f"Split totals → Train: {len(self.train_samples)}, "
+            f"Val: {len(self.val_samples)}"
+        )
         self.logger.info(f"Vocabulary size: {len(self.tokenizer)}")
 
-        # Log complexity distribution
+        # ── Complexity Distribution ────────────────────────────────
         complexity_counts = {'simple': 0, 'medium': 0, 'complex': 0}
         for s in self.train_samples:
-            complexity_counts[s.get('complexity', get_complexity(s.get('latex', '')))] += 1
+            c = s.get('complexity', get_complexity(s.get('latex', '')))
+            complexity_counts[c] = complexity_counts.get(c, 0) + 1
         self.logger.info(
-            f"  Train complexity: simple={complexity_counts['simple']}, "
-            f"medium={complexity_counts['medium']}, complex={complexity_counts['complex']}"
+            f"Train complexity distribution: "
+            f"simple={complexity_counts['simple']:,}, "
+            f"medium={complexity_counts['medium']:,}, "
+            f"complex={complexity_counts['complex']:,}"
         )
 
-        # Store full train set for curriculum learning
+        # Store the full train set for curriculum learning.
+        # curriculum logic will filter this down each phase.
         self.all_train_samples = list(self.train_samples)
 
-        # Set up loss function (standard or structure-aware)
+        # ── Loss Function ──────────────────────────────────────────
         if self.config.structure_aware_loss:
             self.criterion = StructureAwareLoss(
                 tokenizer=self.tokenizer,
@@ -224,26 +291,54 @@ class Trainer:
                 label_smoothing=self.config.label_smoothing,
                 structural_weight=self.config.structural_token_weight,
             ).to(self.device)
-            self.logger.info("Using StructureAwareLoss")
+            self.logger.info(
+                f"Loss: StructureAwareLoss "
+                f"(structural_weight={self.config.structural_token_weight})"
+            )
         else:
             self.criterion = LabelSmoothedCELoss(
                 pad_id=self.tokenizer.pad_id,
                 label_smoothing=self.config.label_smoothing,
             ).to(self.device)
-            self.logger.info("Using LabelSmoothedCELoss")
+            self.logger.info("Loss: LabelSmoothedCELoss")
 
-        self.tokenizer.save(os.path.join(self.config.output_dir, "tokenizer.json"))
+        # ── Persist Tokenizer ──────────────────────────────────────
+        tokenizer_path = os.path.join(self.config.output_dir, "tokenizer.json")
+        self.tokenizer.save(tokenizer_path)
+        self.logger.info(f"Tokenizer saved → {tokenizer_path}")
 
     # ----------------------------------------------------------------
     # PHASE 2: Create DataLoaders
     # ----------------------------------------------------------------
 
     def create_dataloaders(self):
-        """Create train and val DataLoaders from preprocessed samples."""
+        """
+        Build MathDataset instances and wrap them in DataLoaders.
+
+        Train loader:
+          - Uses MultiDatasetBatchSampler for temperature-based
+            per-dataset sampling when multiple datasets are present.
+          - Falls back to a standard shuffled DataLoader for single-
+            dataset scenarios.
+          - persistent_workers=True keeps worker processes alive
+            between epochs (avoids 280+ process spawns over 70 epochs).
+          - prefetch_factor=2 keeps 2 batches pre-loaded per worker
+            so the GPU never waits on CPU augmentation.
+
+        Val loader:
+          - batch_size = config.batch_size // 2
+            During validation we run forward passes without the memory
+            savings of gradient checkpointing. At batch_size=192 this
+            would OOM on most GPUs; halving it keeps peak VRAM safe
+            while still being fast (no augmentation overhead).
+          - No shuffling — deterministic evaluation order.
+        """
         self.logger.info("Creating DataLoaders...")
         self._compute_dataset_ranges(self.train_samples)
 
-        train_transform = get_train_augmentation(self.config.img_height, self.config.img_width)
+        train_transform = get_train_augmentation(
+            self.config.img_height, self.config.img_width
+        )
         val_transform = get_val_augmentation()
 
         self.train_dataset = MathDataset(
@@ -255,16 +350,7 @@ class Trainer:
 
         collate_fn = get_collate_fn(self.tokenizer.pad_id)
 
-        # ----------------------------------------------------------------
-        # persistent_workers=True — workers stay alive across epochs.
-        #   Without this, all 4 workers are killed and respawned at the end
-        #   of every epoch. At 70 epochs, that's 280 unnecessary process
-        #   spawns, each adding several seconds of startup overhead.
-        #
-        # prefetch_factor=2 — each worker pre-loads 2 batches ahead.
-        #   The GPU never sits idle waiting for the CPU to finish augmentation.
-        # ----------------------------------------------------------------
-
+        # ── Train DataLoader ───────────────────────────────────────
         if self.dataset_ranges:
             batch_sampler = MultiDatasetBatchSampler(
                 dataset_ranges=self.dataset_ranges,
@@ -294,9 +380,17 @@ class Trainer:
                 drop_last=True,
             )
 
+        # ── Val DataLoader ─────────────────────────────────────────
+        # SAFETY FIX: halve batch size for validation.
+        # Validation runs without gradient checkpointing, so peak VRAM
+        # per-sample is higher than during training. At config.batch_size
+        # = 192 this would OOM; // 2 = 96 keeps us safely in budget.
+        # Minimum of 1 prevents edge cases with tiny batch configs.
+        val_batch_size = max(self.config.batch_size // 2, 1)
+
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=val_batch_size,
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=self.config.num_workers,
@@ -306,14 +400,22 @@ class Trainer:
         )
 
         self.logger.info(
-            f"Train: {len(self.train_dataset)} samples | "
-            f"Val: {len(self.val_dataset)} samples | "
-            f"Workers: {self.config.num_workers} | "
-            f"Batch: {self.config.batch_size}"
+            f"Train: {len(self.train_dataset):,} samples | "
+            f"Val: {len(self.val_dataset):,} samples | "
+            f"Train batch: {self.config.batch_size} | "
+            f"Val batch: {val_batch_size} | "
+            f"Workers: {self.config.num_workers}"
         )
 
     def _compute_dataset_ranges(self, samples: List):
-        """Compute per-dataset contiguous index ranges for temperature sampling."""
+        """
+        Compute per-dataset contiguous index ranges for temperature sampling.
+
+        MultiDatasetBatchSampler needs to know where each dataset's
+        samples start and end in the flat sample list. Since we sorted
+        samples by dataset_name in preprocess_data(), these ranges are
+        guaranteed to be contiguous.
+        """
         self.dataset_ranges = {}
         current_idx = 0
 
@@ -328,7 +430,8 @@ class Trainer:
         for name, rng in self.dataset_ranges.items():
             self.dataset_ranges[name] = tuple(rng)
             self.logger.info(
-                f"  {name}: {rng[1] - rng[0]} samples (range {rng[0]}–{rng[1]})"
+                f"  {name}: {rng[1] - rng[0]:,} samples "
+                f"(idx {rng[0]}–{rng[1] - 1})"
             )
 
     # ----------------------------------------------------------------
@@ -337,12 +440,19 @@ class Trainer:
 
     def build_model(self):
         """
-        Initialize Swin-v2 encoder + Transformer decoder (8 layers).
+        Initialize Swin-v2 encoder + Transformer decoder (10 layers).
 
         Applies:
           - Differential learning rates (encoder 1e-5, decoder 1e-4)
           - Optional encoder freeze for the first freeze_encoder_epochs epochs
           - Optional torch.compile()
+          - OneCycleLR scheduler sized to total_training_steps
+
+        OneCycleLR note:
+          math.ceil is used for steps_per_epoch to prevent undercounting
+          when len(loader) % accumulation_steps != 0. Undercounting would
+          cause the scheduler to exhaust its budget before training ends,
+          leaving the last steps at an extremely low LR.
         """
         self.logger.info("=" * 70)
         self.logger.info("PHASE 2: Model Initialization")
@@ -352,47 +462,55 @@ class Trainer:
         self.model = TAMERModel(vocab_size, self.config)
         self.model = self.model.to(self.device)
 
-        # Optional: torch.compile for 10-30% speed gain on PyTorch 2.x.
-        # Adds a one-time JIT warmup cost on the first epoch (~2-3 min).
+        # ── torch.compile ──────────────────────────────────────────
+        # torch.compile() traces the model's forward pass and compiles
+        # it into optimised GPU kernels (Triton on CUDA). On H100 this
+        # gives 20-40% throughput improvement. The first forward pass
+        # triggers JIT compilation — expect a 3-5 minute pause on
+        # epoch 1, step 1. Every subsequent step runs the cached kernel.
         if self.config.compile_model and hasattr(torch, 'compile'):
-            self.logger.info("Applying torch.compile() — first epoch will be slower (JIT warmup)")
+            self.logger.info(
+                "Applying torch.compile() — first epoch will pause ~3-5 min "
+                "for JIT compilation (H100 Tensor Core kernel generation)"
+            )
             self.model = torch.compile(self.model)
 
+        # ── Parameter counts ───────────────────────────────────────
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(f"Total parameters:     {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable:,}")
-        self.logger.info(f"Model size (fp32):    ~{total_params * 4 / 1e9:.2f} GB")
-        self.logger.info(f"Model size (fp16):    ~{total_params * 2 / 1e9:.2f} GB")
+        trainable = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+        self.logger.info(f"Total parameters     : {total_params:,}")
+        self.logger.info(f"Trainable parameters : {trainable:,}")
+        self.logger.info(f"Model size (fp32)    : ~{total_params * 4 / 1e9:.2f} GB")
+        self.logger.info(f"Model size (fp16)    : ~{total_params * 2 / 1e9:.2f} GB")
 
-        # ----------------------------------------------------------------
-        # Encoder Freeze Warmup
+        # ── Encoder Freeze Warmup ──────────────────────────────────
+        # Freeze encoder weights for the first freeze_encoder_epochs
+        # epochs. The decoder (randomly initialised) learns to interpret
+        # the encoder's existing feature map before we allow gradients
+        # to flow back into it. This prevents the strong gradient signal
+        # from a random decoder from corrupting pre-trained encoder weights.
         #
-        # Freeze encoder weights for the first freeze_encoder_epochs epochs.
-        # Benefit: the randomly-initialised decoder can learn to read the
-        # encoder's existing feature map without destabilising it. Once the
-        # decoder has a reasonable representation, the encoder unfreezes and
-        # fine-tunes at its lower LR alongside the decoder.
-        #
-        # The optimizer still tracks frozen encoder params (so LR scheduling
-        # is consistent), but gradients for them are zero during the freeze.
-        # When unfreezing happens in train(), requires_grad is simply set back
-        # to True — no optimizer rebuild needed.
-        # ----------------------------------------------------------------
+        # The optimizer still receives encoder params so the LR schedule
+        # is consistent. Gradients are zeroed by requires_grad=False.
+        # Unfreezing in train() just flips requires_grad back to True —
+        # no optimizer rebuild required.
         if self.config.freeze_encoder_epochs > 0:
             for p in self.model.encoder.parameters():
                 p.requires_grad = False
-            trainable_after_freeze = sum(
-                p.numel() for p in self.model.parameters() if p.requires_grad
+            frozen_count = sum(
+                p.numel() for p in self.model.encoder.parameters()
             )
-            frozen_count = trainable - trainable_after_freeze
+            active_count = trainable - frozen_count
             self.logger.info(
                 f"Encoder FROZEN for epochs 1-{self.config.freeze_encoder_epochs} "
-                f"({frozen_count:,} params frozen, {trainable_after_freeze:,} active)"
+                f"({frozen_count:,} params frozen, {active_count:,} active)"
             )
         else:
             self.logger.info("Encoder freeze disabled (freeze_encoder_epochs=0)")
 
+        # ── Differential Learning Rates ────────────────────────────
         encoder_params = list(self.model.encoder.parameters())
         decoder_params = list(self.model.decoder.parameters())
 
@@ -406,8 +524,7 @@ class Trainer:
             weight_decay=self.config.weight_decay,
         )
 
-        # math.ceil prevents undercounting when len(loader) % accumulation_steps != 0,
-        # which would cause OneCycleLR to end before the scheduler completes its anneal.
+        # ── OneCycleLR ─────────────────────────────────────────────
         steps_per_epoch = math.ceil(
             len(self.train_loader) / self.config.accumulation_steps
         )
@@ -425,10 +542,14 @@ class Trainer:
         )
 
         self.logger.info(
-            f"Encoder LR: {self.config.encoder_lr} | "
-            f"Decoder LR: {self.config.decoder_lr} | "
-            f"Effective batch: {self.config.batch_size * self.config.accumulation_steps} | "
-            f"Total steps: {self.config.total_training_steps}"
+            f"Encoder LR      : {self.config.encoder_lr:.1e} | "
+            f"Decoder LR      : {self.config.decoder_lr:.1e}"
+        )
+        self.logger.info(
+            f"Effective batch : "
+            f"{self.config.batch_size * self.config.accumulation_steps} | "
+            f"Steps/epoch: {steps_per_epoch} | "
+            f"Total steps: {self.config.total_training_steps:,}"
         )
 
     # ----------------------------------------------------------------
@@ -436,7 +557,20 @@ class Trainer:
     # ----------------------------------------------------------------
 
     def train(self):
-        """Main training loop."""
+        """
+        Main training loop.
+
+        Epoch structure:
+          1. (Maybe) unfreeze encoder
+          2. (Maybe) advance curriculum stage → rebuild DataLoader
+          3. Iterate over train_loader, accumulating gradients
+          4. Every accumulation_steps batches: optimizer + scheduler step
+          5. Log every 10 global steps
+          6. End of epoch: flush remaining gradients, log epoch summary
+          7. Every eval_every epochs: run validation
+          8. Every checkpoint_every_epochs epochs: save + push checkpoint
+          9. Early stopping check
+        """
         self.logger.info("=" * 70)
         self.logger.info("PHASE 3: Training Loop")
         self.logger.info("=" * 70)
@@ -454,12 +588,13 @@ class Trainer:
             )
         if self.config.curriculum_enabled:
             self.logger.info(
-                f"Curriculum: simple until epoch {self.config.curriculum_simple_until}, "
+                f"Curriculum: simple only until epoch "
+                f"{self.config.curriculum_simple_until}, "
                 f"+medium until epoch {self.config.curriculum_medium_until}, "
                 f"then all data"
             )
 
-        # Profile the DataLoader before training starts.
+        # Profile I/O before training starts.
         self._profile_dataloader()
 
         self.model.train()
@@ -467,11 +602,9 @@ class Trainer:
         self.optimizer.zero_grad()
 
         for epoch in range(self.current_epoch, self.config.num_epochs):
-            self.current_epoch = epoch + 1  # 1-indexed
+            self.current_epoch = epoch + 1  # 1-indexed for human-readable logs
 
-            # ----------------------------------------------------------------
-            # Encoder Unfreeze
-            # ----------------------------------------------------------------
+            # ── Encoder Unfreeze ───────────────────────────────────
             if (self.config.freeze_encoder_epochs > 0 and
                     self.current_epoch == self.config.freeze_encoder_epochs + 1):
                 for p in self.model.encoder.parameters():
@@ -485,19 +618,15 @@ class Trainer:
                     f"LR={self.config.encoder_lr:.1e} ***"
                 )
 
-            # ----------------------------------------------------------------
-            # Curriculum Learning
-            # Advance to harder data when epoch thresholds are crossed.
-            # Rebuilds the dataloader with the new filtered sample set.
-            # ----------------------------------------------------------------
+            # ── Curriculum Learning ────────────────────────────────
             if self.config.curriculum_enabled:
                 new_stage = self._get_curriculum_stage(self.current_epoch)
                 if new_stage != self._current_curriculum_stage:
                     self.logger.info(
-                        f"*** Curriculum advance: {self._current_curriculum_stage} → {new_stage} ***"
+                        f"*** Curriculum advance: "
+                        f"{self._current_curriculum_stage} → {new_stage} ***"
                     )
                     self._current_curriculum_stage = new_stage
-                    # Rebuild train dataloader with new samples
                     self._rebuild_train_loader_for_curriculum(new_stage)
 
             self.epoch_start_time = time.time()
@@ -505,14 +634,17 @@ class Trainer:
             epoch_steps = 0
 
             self.logger.info(
-                f"\n{'='*40} Epoch {self.current_epoch}/{self.config.num_epochs} {'='*40}"
+                f"\n{'='*35} "
+                f"Epoch {self.current_epoch}/{self.config.num_epochs} "
+                f"{'='*35}"
             )
 
+            # ── Batch Loop ─────────────────────────────────────────
             for batch_idx, batch in enumerate(self.train_loader):
                 if batch is None:
                     continue
 
-                # Update temperature for the multi-dataset sampler
+                # Update temperature for the multi-dataset sampler.
                 current_temp = get_temperature_for_step(
                     self.global_step,
                     self.config.total_training_steps,
@@ -536,7 +668,7 @@ class Trainer:
                 epoch_loss += loss
                 epoch_steps += 1
 
-                # Optimizer step every accumulation_steps batches
+                # Optimizer step every accumulation_steps micro-batches.
                 if (batch_idx + 1) % self.config.accumulation_steps == 0:
                     optimizer_step(
                         model=self.model,
@@ -554,15 +686,18 @@ class Trainer:
                         self.logger.info(
                             f"Step {self.global_step:>6d} | "
                             f"Loss: {avg_loss:.4f} | "
-                            f"LR: enc={current_lr[0]:.2e} dec={current_lr[1]:.2e} | "
+                            f"LR: enc={current_lr[0]:.2e} "
+                            f"dec={current_lr[1]:.2e} | "
                             f"Temp: {current_temp:.3f} | "
                             f"Epoch: {self.current_epoch} | "
-                            f"10-step time: {elapsed:.1f}s"
+                            f"10-step: {elapsed:.1f}s"
                         )
                         self.step_start_time = time.time()
 
-            # Flush remaining accumulated gradients at end of epoch
-            if epoch_steps % self.config.accumulation_steps != 0:
+            # ── Flush Remaining Gradients ──────────────────────────
+            # If the last batch doesn't land on an accumulation boundary,
+            # we still need to step the optimizer before the epoch ends.
+            if epoch_steps > 0 and epoch_steps % self.config.accumulation_steps != 0:
                 optimizer_step(
                     model=self.model,
                     optimizer=self.optimizer,
@@ -575,25 +710,23 @@ class Trainer:
             epoch_time = time.time() - self.epoch_start_time
             avg_loss = epoch_loss / max(epoch_steps, 1)
 
-            # Indicate encoder freeze status in the epoch summary line
             enc_status = (
-                "FROZEN" if (
-                    self.config.freeze_encoder_epochs > 0 and
-                    self.current_epoch <= self.config.freeze_encoder_epochs
-                ) else "active"
+                "FROZEN"
+                if (self.config.freeze_encoder_epochs > 0 and
+                    self.current_epoch <= self.config.freeze_encoder_epochs)
+                else "active"
             )
             self.logger.info(
-                f"Epoch {self.current_epoch} done | "
+                f"Epoch {self.current_epoch} complete | "
                 f"Loss: {avg_loss:.4f} | "
                 f"Time: {epoch_time / 60:.1f} min | "
                 f"Step: {self.global_step} | "
                 f"Encoder: {enc_status}"
             )
 
-            # ----------------------------------------------------------------
-            # Evaluation — run every eval_every epochs, not every epoch.
-            # During warmup epochs, cap the val set to avoid long waits.
-            # ----------------------------------------------------------------
+            # ── Evaluation ─────────────────────────────────────────
+            # Run every eval_every epochs. During warmup, cap samples
+            # to avoid multi-minute waits on early (poor) models.
             is_best = False
             if self.current_epoch % self.config.eval_every == 0:
                 in_warmup = self.current_epoch <= self.config.eval_warmup_epochs
@@ -605,27 +738,28 @@ class Trainer:
                     max_samples=max_samples,
                 )
 
-            # Early stopping counter
+            # ── Early Stopping Counter ─────────────────────────────
             if is_best:
                 self.epochs_without_improvement = 0
             else:
                 self.epochs_without_improvement += 1
 
-            # Epoch checkpoint (every N epochs)
+            # ── Epoch Checkpoint ───────────────────────────────────
             if self.current_epoch % self.config.checkpoint_every_epochs == 0:
                 self._save_epoch_checkpoint()
 
-            # Early stopping
+            # ── Early Stopping ─────────────────────────────────────
             if self.epochs_without_improvement >= self.config.early_stopping_patience:
                 self.logger.info(
-                    f"Early stopping after {self.epochs_without_improvement} epochs without improvement."
+                    f"Early stopping triggered after "
+                    f"{self.epochs_without_improvement} epochs without improvement."
                 )
                 break
 
         self.logger.info("=" * 70)
         self.logger.info("Training complete!")
-        self.logger.info(f"Best ExpRate:    {self.best_exp_rate:.4f}")
-        self.logger.info(f"Best EditDist:   {self.best_edit_dist:.2f}")
+        self.logger.info(f"Best ExpRate  : {self.best_exp_rate:.4f}")
+        self.logger.info(f"Best EditDist : {self.best_edit_dist:.2f}")
 
     # ----------------------------------------------------------------
     # Evaluation
@@ -634,17 +768,27 @@ class Trainer:
     def _evaluate(
         self,
         use_beam_search: bool = False,
-        max_samples: int = None,
+        max_samples: Optional[int] = None,
     ) -> Tuple[Dict[str, float], bool]:
         """
         Run evaluation on the validation set via engine.evaluate_full().
 
-        Returns (metrics_dict, is_best).
+        Args:
+            use_beam_search: If True, uses beam search decoding (slower,
+                more accurate). If False, uses greedy decoding.
+            max_samples: If set, evaluation stops after this many samples.
+                Used during warmup epochs to cap evaluation time.
+
+        Returns:
+            (metrics_dict, is_best) where is_best is True if this run
+            achieved a new minimum edit distance.
         """
         sample_desc = f" (capped at {max_samples})" if max_samples else ""
         self.logger.info(
-            f"Evaluating{sample_desc} (beam={use_beam_search})..."
+            f"Evaluating{sample_desc} | beam={use_beam_search} ..."
         )
+
+        self.model.eval()
 
         metrics, all_preds, all_targets = evaluate_full(
             model=self.model,
@@ -659,6 +803,8 @@ class Trainer:
             max_samples=max_samples,
         )
 
+        self.model.train()
+
         self.logger.info(
             f"  EVAL | Loss: {metrics.get('val_loss', 0.0):.4f} | "
             f"ExpRate: {metrics['exact_match']:.4f} | "
@@ -667,11 +813,9 @@ class Trainer:
             f"Leq1: {metrics['leq1']:.4f}"
         )
 
-        # Structural accuracy breakdown (per-complexity + structural token recall)
+        # ── Structural Accuracy Breakdown ──────────────────────────
         try:
-            struct_metrics = evaluate_structural_accuracy(
-                all_preds, all_targets
-            )
+            struct_metrics = evaluate_structural_accuracy(all_preds, all_targets)
         except Exception as e:
             self.logger.warning(f"Failed to compute structural metrics: {e}")
             struct_metrics = {}
@@ -680,22 +824,27 @@ class Trainer:
             self.logger.info(
                 f"  STRUCT | "
                 f"simple={struct_metrics.get('exprate_simple', 0):.3f} "
-                f"({struct_metrics.get('count_simple', 0)}) | "
+                f"(n={struct_metrics.get('count_simple', 0)}) | "
                 f"medium={struct_metrics.get('exprate_medium', 0):.3f} "
-                f"({struct_metrics.get('count_medium', 0)}) | "
+                f"(n={struct_metrics.get('count_medium', 0)}) | "
                 f"complex={struct_metrics.get('exprate_complex', 0):.3f} "
-                f"({struct_metrics.get('count_complex', 0)}) | "
-                f"struct_recall={struct_metrics.get('structural_token_recall', 0):.3f}"
+                f"(n={struct_metrics.get('count_complex', 0)}) | "
+                f"struct_recall="
+                f"{struct_metrics.get('structural_token_recall', 0):.3f}"
             )
             metrics.update(struct_metrics)
 
-        # Early stopping on edit distance (lower is better).
+        # ── Best Model Update ──────────────────────────────────────
+        # Primary metric: edit distance (lower is better).
+        # ExpRate is recorded for logging but not used as the stopping criterion
+        # because it's binary (exact match) and less informative on long sequences.
         is_best = metrics['edit_dist'] < self.best_edit_dist
         if is_best:
             self.best_exp_rate = metrics['exact_match']
             self.best_edit_dist = metrics['edit_dist']
             self.logger.info(
-                f"  *** New best | EditDist: {self.best_edit_dist:.2f} | "
+                f"  *** New best | "
+                f"EditDist: {self.best_edit_dist:.2f} | "
                 f"ExpRate: {self.best_exp_rate:.4f} ***"
             )
 
@@ -703,7 +852,10 @@ class Trainer:
             save_checkpoint(
                 self.model, self.optimizer, self.scheduler, self.scaler,
                 self.current_epoch, self.global_step,
-                {'exp_rate': self.best_exp_rate, 'edit_dist': self.best_edit_dist},
+                {
+                    'exp_rate': self.best_exp_rate,
+                    'edit_dist': self.best_edit_dist,
+                },
                 best_path,
             )
 
@@ -713,16 +865,30 @@ class Trainer:
             )
             if should_push:
                 self._last_hf_push_epoch = self.current_epoch
-                _push_hf_background(best_path, self.config, self.current_epoch, is_best=True)
+                _push_hf_background(
+                    best_path, self.config, self.current_epoch, is_best=True
+                )
 
         return metrics, is_best
 
     def evaluate_with_beam_search(self, max_samples: int = 500) -> Dict[str, float]:
         """
-        Public method for beam-search evaluation.
-        Called by train.py in eval-only mode (--eval-only flag).
+        Public convenience method for beam-search evaluation.
+
+        Called by train.py in --eval-only mode. Internally delegates to
+        _evaluate() with use_beam_search=True.
+
+        Args:
+            max_samples: Cap on validation samples (default 500 to keep
+                beam-search evaluation under ~5 minutes).
+
+        Returns:
+            metrics dict from evaluate_full().
         """
-        metrics, _ = self._evaluate(use_beam_search=True, max_samples=max_samples)
+        metrics, _ = self._evaluate(
+            use_beam_search=True,
+            max_samples=max_samples,
+        )
         return metrics
 
     # ----------------------------------------------------------------
@@ -730,9 +896,19 @@ class Trainer:
     # ----------------------------------------------------------------
 
     def _get_curriculum_stage(self, epoch: int) -> str:
-        """Return the curriculum stage based on the current epoch."""
+        """
+        Map the current epoch to a curriculum stage name.
+
+        Stages:
+          'simple'  — only samples with simple complexity (single-line formulas)
+          'medium'  — simple + medium (aligned environments, cases)
+          'complex' — all data (matrices, arrays, nested environments)
+
+        If curriculum_enabled is False, always returns 'complex' so the
+        full dataset is used from epoch 1.
+        """
         if not self.config.curriculum_enabled:
-            return 'complex' # all data
+            return 'complex'
         if epoch <= self.config.curriculum_simple_until:
             return 'simple'
         if epoch <= self.config.curriculum_medium_until:
@@ -740,30 +916,45 @@ class Trainer:
         return 'complex'
 
     def _rebuild_train_loader_for_curriculum(self, stage: str):
-        """Rebuild the train dataloader with samples up to the given complexity stage."""
+        """
+        Rebuild the train DataLoader with samples filtered to the given stage.
+
+        Called whenever the curriculum stage advances. Tears down the old
+        DataLoader (allowing worker processes to die) and creates a fresh
+        one with the new filtered sample set.
+
+        Note: The val DataLoader is intentionally never filtered — we always
+        evaluate on the full val set regardless of curriculum stage so that
+        metrics are comparable across epochs.
+
+        Args:
+            stage: One of 'simple', 'medium', 'complex'.
+        """
         if stage == 'simple':
             allowed = {'simple'}
         elif stage == 'medium':
             allowed = {'simple', 'medium'}
-        else: # complex
+        else:  # 'complex' — all data
             allowed = {'simple', 'medium', 'complex'}
 
-        filtered_samples = []
-        for s in self.all_train_samples:
-            complexity = s.get('complexity', get_complexity(s.get('latex', '')))
-            if complexity in allowed:
-                filtered_samples.append(s)
+        filtered_samples = [
+            s for s in self.all_train_samples
+            if s.get('complexity', get_complexity(s.get('latex', ''))) in allowed
+        ]
 
         self.logger.info(
-            f"Curriculum stage {stage}: {len(filtered_samples)} / {len(self.all_train_samples)} "
-            f"train samples available."
+            f"Curriculum rebuild ({stage}): "
+            f"{len(filtered_samples):,} / {len(self.all_train_samples):,} "
+            f"train samples available"
         )
 
         self.train_samples = filtered_samples
         self._compute_dataset_ranges(self.train_samples)
 
-        train_transform = get_train_augmentation(self.config.img_height, self.config.img_width)
-        
+        train_transform = get_train_augmentation(
+            self.config.img_height, self.config.img_width
+        )
+
         self.train_dataset = MathDataset(
             samples=self.train_samples,
             config=self.config,
@@ -773,20 +964,41 @@ class Trainer:
 
         collate_fn = get_collate_fn(self.tokenizer.pad_id)
 
-        batch_sampler = MultiDatasetBatchSampler(
-            dataset=self.train_dataset,
-            dataset_ranges=self.dataset_ranges,
-            batch_size=self.config.batch_size,
-        )
+        # Use MultiDatasetBatchSampler if we have multiple datasets,
+        # otherwise fall back to a standard shuffled loader.
+        if self.dataset_ranges:
+            batch_sampler = MultiDatasetBatchSampler(
+                dataset_ranges=self.dataset_ranges,
+                batch_size=self.config.batch_size,
+                temperature=self.config.temp_start,
+                drop_last=True,
+            )
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                num_workers=self.config.num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2,
+            )
+        else:
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=self.config.num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2,
+                drop_last=True,
+            )
 
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=collate_fn,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+        self.logger.info(
+            f"Train DataLoader rebuilt | "
+            f"Stage: {stage} | "
+            f"Batches/epoch: ~{len(self.train_loader)}"
         )
 
     # ----------------------------------------------------------------
@@ -794,18 +1006,33 @@ class Trainer:
     # ----------------------------------------------------------------
 
     def _save_epoch_checkpoint(self):
-        """Save an epoch checkpoint and push to HF (throttled, background)."""
+        """
+        Save an epoch checkpoint and push to HuggingFace (throttled, background).
+
+        Checkpoint filename: epoch_{N}.pt
+        Old checkpoints are cleaned up to keep only the last N on disk.
+        HF push is throttled by hf_push_every_n_epochs to avoid hammering
+        the API on every checkpoint save.
+        """
         ckpt_path = os.path.join(
             self.config.checkpoint_dir,
-            f"epoch_{self.current_epoch}.pt"
+            f"epoch_{self.current_epoch}.pt",
         )
         save_checkpoint(
             self.model, self.optimizer, self.scheduler, self.scaler,
             self.current_epoch, self.global_step,
-            {'exp_rate': self.best_exp_rate, 'edit_dist': self.best_edit_dist},
+            {
+                'exp_rate': self.best_exp_rate,
+                'edit_dist': self.best_edit_dist,
+            },
             ckpt_path,
         )
-        cleanup_old_checkpoints(self.config.checkpoint_dir, self.config.keep_last_n_checkpoints)
+        self.logger.info(f"Checkpoint saved → {ckpt_path}")
+
+        cleanup_old_checkpoints(
+            self.config.checkpoint_dir,
+            self.config.keep_last_n_checkpoints,
+        )
 
         should_push = (
             self.current_epoch - self._last_hf_push_epoch
@@ -813,10 +1040,18 @@ class Trainer:
         )
         if should_push:
             self._last_hf_push_epoch = self.current_epoch
-            _push_hf_background(ckpt_path, self.config, self.current_epoch, is_best=False)
+            _push_hf_background(
+                ckpt_path, self.config, self.current_epoch, is_best=False
+            )
 
     def _auto_resume(self) -> bool:
-        """Auto-resume from the latest checkpoint if one exists."""
+        """
+        Auto-resume from the latest checkpoint if one exists.
+
+        Scans config.checkpoint_dir for epoch_*.pt files and loads
+        the most recent one. Returns True if a checkpoint was loaded,
+        False if starting from scratch.
+        """
         latest = find_latest_checkpoint(self.config.checkpoint_dir)
         if latest is None:
             self.logger.info("No checkpoint found — starting from scratch")
@@ -837,12 +1072,26 @@ class Trainer:
         self.best_edit_dist = metrics.get('edit_dist', float('inf'))
         self.logger.info(
             f"Resumed: epoch={epoch}, step={step}, "
-            f"best_edit_dist={self.best_edit_dist:.2f}"
+            f"best_edit_dist={self.best_edit_dist:.2f}, "
+            f"best_exp_rate={self.best_exp_rate:.4f}"
         )
         return True
 
     def resume_from_checkpoint(self, checkpoint_path: str):
-        """Resume training from a specific checkpoint path."""
+        """
+        Resume training from a specific checkpoint path.
+
+        Unlike _auto_resume(), this method is called explicitly with a
+        user-specified path (via --resume flag or direct API call).
+
+        Args:
+            checkpoint_path: Absolute or relative path to a .pt checkpoint.
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {checkpoint_path}"
+            )
+
         self.logger.info(f"Resuming from: {checkpoint_path}")
         epoch, step, metrics = load_checkpoint(
             checkpoint_path,
@@ -856,6 +1105,10 @@ class Trainer:
         self.global_step = step
         self.best_exp_rate = metrics.get('exp_rate', 0.0)
         self.best_edit_dist = metrics.get('edit_dist', float('inf'))
+        self.logger.info(
+            f"Loaded: epoch={epoch}, step={step}, "
+            f"best_edit_dist={self.best_edit_dist:.2f}"
+        )
 
     # ----------------------------------------------------------------
     # Diagnostics
@@ -864,30 +1117,71 @@ class Trainer:
     def _profile_dataloader(self):
         """
         Time one batch from the DataLoader before training starts.
-        If this takes > 2 seconds, your bottleneck is I/O, not GPU.
+
+        This is a quick I/O health check. If it takes > 2 seconds to
+        load the first batch, the training bottleneck is disk/CPU, not
+        GPU — and you should investigate augmentation complexity or
+        storage speed before committing to a long training run.
+
+        At batch_size=192 with 16 workers, a healthy H100 setup should
+        load the first batch in < 1 second.
         """
         self.logger.info("Profiling DataLoader (timing first batch)...")
         t0 = time.time()
+        first_batch = None
         for batch in self.train_loader:
             if batch is not None:
+                first_batch = batch
                 break
         elapsed = time.time() - t0
 
         if elapsed > 2.0:
             self.logger.warning(
-                f"DataLoader first batch: {elapsed:.2f}s — "
-                f"SLOW. Your bottleneck is I/O, not GPU. "
-                f"Check augmentation complexity and disk read speed."
+                f"DataLoader first batch: {elapsed:.2f}s — SLOW. "
+                f"Bottleneck is I/O, not GPU. "
+                f"Check: augmentation complexity, num_workers ({self.config.num_workers}), "
+                f"disk read speed (SSD vs HDD), and image decode overhead."
             )
         else:
-            self.logger.info(f"DataLoader first batch: {elapsed:.2f}s — OK")
+            self.logger.info(
+                f"DataLoader first batch: {elapsed:.2f}s — OK "
+                f"(workers={self.config.num_workers})"
+            )
+
+        if first_batch is not None:
+            images = first_batch.get('images', first_batch[0] if isinstance(first_batch, (list, tuple)) else None)
+            if images is not None and hasattr(images, 'shape'):
+                self.logger.info(
+                    f"Batch shape: {tuple(images.shape)} | "
+                    f"dtype: {images.dtype}"
+                )
 
     # ----------------------------------------------------------------
     # MAIN: Full Pipeline
     # ----------------------------------------------------------------
 
-    def run(self, resume_from: str = None):
-        """Run the complete pipeline in strict order."""
+    def run(self, resume_from: Optional[str] = None):
+        """
+        Run the complete training pipeline in strict order.
+
+        Order is fixed and intentional:
+          1. preprocess_data() — must run before create_dataloaders()
+             because it builds self.tokenizer and self.train/val_samples.
+          2. create_dataloaders() — must run before build_model()
+             because build_model() reads len(self.train_loader) to size
+             the OneCycleLR scheduler.
+          3. build_model() — must run before any checkpoint loading
+             because load_checkpoint() restores state into existing objects.
+          4. resume/auto_resume — loads weights + optimizer state.
+          5. train() — main loop.
+          6. Final beam-search eval — capped at 500 samples to avoid
+             a multi-hour wait at the end of a long training run.
+
+        Args:
+            resume_from: If provided and the path exists, resume from
+                this specific checkpoint. Otherwise, auto-resume from
+                the latest checkpoint in checkpoint_dir (if any).
+        """
         self.preprocess_data()
         self.create_dataloaders()
         self.build_model()
@@ -899,8 +1193,12 @@ class Trainer:
 
         self.train()
 
-        # Final evaluation with beam search (capped to 500 to avoid multi-hour wait)
-        self.logger.info("Running final beam-search evaluation (500 samples)...")
+        # Final evaluation with beam search.
+        # Capped at 500 samples — full beam-search eval on a large val
+        # set can take hours; 500 samples gives a reliable estimate.
+        self.logger.info(
+            "Running final beam-search evaluation (500 samples)..."
+        )
         self._evaluate(use_beam_search=True, max_samples=500)
 
         self.logger.info("=" * 70)
