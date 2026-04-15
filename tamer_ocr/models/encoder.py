@@ -5,8 +5,12 @@ FIXED:
 - Explicit dimension checking to prevent shape mismatch in self.proj.
 - Handles both (B, C, H, W) and (B, H, W, C) outputs from timm backbones.
 - Corrected flattened length calculation for linear layers.
-- config.encoder_model → config.encoder_name (correct Config attribute name).
+- config.encoder_model -> config.encoder_name (correct Config attribute name).
 - Fallback list updated to real timm model identifiers.
+- img_size=(H, W) passed to timm.create_model so the patch embedding accepts
+  rectangular 256x1024 input instead of asserting square 256x256.
+  SwinV2 window attention is inherently spatial; both dims just need to be
+  divisible by patch_size * window_size (4 * 8 = 32). 256 OK  1024 OK
 """
 
 import torch
@@ -21,6 +25,8 @@ class SwinEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+
+        img_size = (config.img_height, config.img_width)  # e.g. (256, 1024)
 
         # Try the configured model name, fall back to known-good alternatives.
         # All names here are real timm identifiers — verify with:
@@ -40,8 +46,9 @@ class SwinEncoder(nn.Module):
                     pretrained=True,
                     features_only=True,
                     out_indices=(3,),
+                    img_size=img_size,  # override patch embed assertion for 256x1024
                 )
-                logger.info(f"Swin backbone loaded: {_name}")
+                logger.info(f"Swin backbone loaded: {_name} | img_size={img_size}")
                 break
             except (RuntimeError, KeyError, Exception) as e:
                 logger.warning(f"timm model not available: {_name} ({e}), trying next...")
@@ -64,7 +71,7 @@ class SwinEncoder(nn.Module):
         self.norm = nn.LayerNorm(config.d_model)
 
         # 2D Positional Encoding
-        # For 256x1024 input at 16x downsample, grid is 16x64.
+        # For 256x1024 input at 16x downsample (4 stages x 2x), grid is 16x64 = 1024 tokens.
         # We set max higher for safety.
         self.pos_enc_2d = PositionalEncoding2D(
             d_model=config.d_model,
@@ -112,7 +119,6 @@ class SwinEncoder(nn.Module):
         x = self.norm(x)
 
         # 4. Apply 2D Positional Encoding
-        # This allows the model to know the spatial location of each math symbol
         x = self.pos_enc_2d(x)
 
         # 5. Flatten spatial patches into a sequence
