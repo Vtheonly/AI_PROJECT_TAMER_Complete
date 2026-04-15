@@ -20,16 +20,42 @@ class SwinEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # Create the backbone
-        # We target Stage 3 (out_indices=2) which typically has 512 channels in Swin-Base.
-        self.backbone = timm.create_model(
-            config.encoder_name,
-            pretrained=True,
-            features_only=True,
-            out_indices=(2,),
-            img_size=(config.img_height, config.img_width)
-        )
 
+        
+        
+        
+        
+                # Try the configured model name, fall back to known-good alternatives
+        _BACKBONE_FALLBACKS = [
+            config.encoder_model,  # primary: swinv2_base_patch4_window8_256
+            "swinv2_base_patch4_window8_256",
+            "swinv2_base_patch4_window12_192",
+            "swin_base_patch4_window7_224",
+        ]
+
+        self.backbone = None
+        for _name in _BACKBONE_FALLBACKS:
+            try:
+                self.backbone = timm.create_model(
+                    _name,
+                    pretrained=True,
+                    features_only=True,
+                    out_indices=(3,),
+                )
+                logger.info(f"Swin backbone loaded: {_name}")
+                break
+            except (RuntimeError, KeyError):
+                logger.warning(f"timm model not available: {_name}, trying next...")
+
+        if self.backbone is None:
+            raise RuntimeError(f"No Swin backbone could be loaded. Tried: {_BACKBONE_FALLBACKS}")
+        
+        
+        
+        
+        
+        
+        
         # Enable gradient checkpointing to save VRAM on Tesla T4/Colab
         self.backbone.set_grad_checkpointing(True)
 
