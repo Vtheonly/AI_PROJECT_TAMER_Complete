@@ -1,10 +1,12 @@
 """
 Swin-Base Encoder with Gradient Checkpointing and 2D Positional Encoding.
 
-FIXED: 
+FIXED:
 - Explicit dimension checking to prevent shape mismatch in self.proj.
 - Handles both (B, C, H, W) and (B, H, W, C) outputs from timm backbones.
 - Corrected flattened length calculation for linear layers.
+- config.encoder_model → config.encoder_name (correct Config attribute name).
+- Fallback list updated to real timm model identifiers.
 """
 
 import torch
@@ -20,17 +22,14 @@ class SwinEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-
-        
-        
-        
-        
-                # Try the configured model name, fall back to known-good alternatives
+        # Try the configured model name, fall back to known-good alternatives.
+        # All names here are real timm identifiers — verify with:
+        #   timm.list_models("swinv2*", pretrained=True)
         _BACKBONE_FALLBACKS = [
-            config.encoder_model,  # primary: swinv2_base_patch4_window8_256
-            "swinv2_base_patch4_window8_256",
-            "swinv2_base_patch4_window12_192",
-            "swin_base_patch4_window7_224",
+            config.encoder_name,                              # primary: swinv2_base_window8_256.ms_in1k
+            "swinv2_base_window8_256.ms_in1k",               # explicit safe fallback (same model)
+            "swinv2_small_window8_256.ms_in1k",              # smaller variant
+            "swin_base_patch4_window7_224.ms_in22k_ft_in1k", # v1 last-resort
         ]
 
         self.backbone = None
@@ -44,38 +43,32 @@ class SwinEncoder(nn.Module):
                 )
                 logger.info(f"Swin backbone loaded: {_name}")
                 break
-            except (RuntimeError, KeyError):
-                logger.warning(f"timm model not available: {_name}, trying next...")
+            except (RuntimeError, KeyError, Exception) as e:
+                logger.warning(f"timm model not available: {_name} ({e}), trying next...")
 
         if self.backbone is None:
             raise RuntimeError(f"No Swin backbone could be loaded. Tried: {_BACKBONE_FALLBACKS}")
-        
-        
-        
-        
-        
-        
-        
+
         # Enable gradient checkpointing to save VRAM on Tesla T4/Colab
         self.backbone.set_grad_checkpointing(True)
 
-        # Get the actual channel count from the backbone's feature info
+        # Get the actual channel count from the backbone's feature info.
         # This prevents hardcoding errors if the model variant changes.
         feature_info = self.backbone.feature_info.get_dicts()
         self.in_channels = feature_info[0]['num_chs']
-        
+
         logger.info(f"Swin Encoder: Backbone features detected with {self.in_channels} channels.")
 
-        # Projection layer to transform backbone channels to model dimension (d_model=512)
+        # Projection layer to transform backbone channels to model dimension (d_model)
         self.proj = nn.Linear(self.in_channels, config.d_model)
         self.norm = nn.LayerNorm(config.d_model)
 
         # 2D Positional Encoding
-        # For 256x1024 input at 16x downsample, grid is 16x64. 
+        # For 256x1024 input at 16x downsample, grid is 16x64.
         # We set max higher for safety.
         self.pos_enc_2d = PositionalEncoding2D(
-            d_model=config.d_model, 
-            max_h=64, 
+            d_model=config.d_model,
+            max_h=64,
             max_w=128
         )
 
@@ -88,13 +81,13 @@ class SwinEncoder(nn.Module):
         """
         # 1. Extract features from Swin
         # Returns a list of tensors; we take the first one since we requested only one index.
-        features = self.backbone(x)[0] 
+        features = self.backbone(x)[0]
         B = features.shape[0]
 
         # 2. Robust Dimension Handling
         # Different timm versions/models return (B, C, H, W) or (B, H, W, C).
         # We must ensure the last dimension is the channel dimension for the Linear layer.
-        
+
         if features.dim() == 4:
             # Check if it's (B, C, H, W)
             if features.shape[1] == self.in_channels:
@@ -102,10 +95,9 @@ class SwinEncoder(nn.Module):
                 features = features.permute(0, 2, 3, 1).contiguous()
             # If it's already (B, H, W, C), do nothing
         elif features.dim() == 3:
-            # If it's (B, L, C), we reshape it to (B, H, W, C) to apply 2D Positional Encoding
+            # If it's (B, L, C), reshape to (B, H, W, C) for 2D Positional Encoding
             H_feat = self.config.img_height // 16
             W_feat = self.config.img_width // 16
-            # Ensure L matches H*W
             if features.shape[1] != (H_feat * W_feat):
                 # Adaptive calculation if input image size was different
                 L = features.shape[1]
