@@ -111,7 +111,10 @@ def _unwrap_model(model: nn.Module) -> TAMERModel:
 # Helper: load sanitized JSONL files (all 4 datasets)
 # ---------------------------------------------------------------------------
 
-def _load_sanitized_samples(sanitized_dir: str) -> Dict[str, List]:
+def _load_sanitized_samples(
+    sanitized_dir: str,
+    data_dir: str = "",
+) -> Dict[str, List]:
     """
     Load pre-sanitized JSONL files from sanitized_dir.
 
@@ -120,6 +123,25 @@ def _load_sanitized_samples(sanitized_dir: str) -> Dict[str, List]:
       hme100k.jsonl
       im2latex.jsonl
       mathwriting.jsonl
+
+    Image path resolution:
+      The sanitizer writes image paths exactly as they appear in the
+      original JSONL files — typically relative to the hf_data folder
+      (e.g. "crohme/images/foo.png").  MathDataset needs an absolute
+      path (or one relative to cwd) to actually open images.
+
+      We resolve each image path by checking, in order:
+        1. Already absolute AND exists → use as-is.
+        2. Relative to data_dir → join and use if the file exists.
+        3. Relative to sanitized_dir → join and use if the file exists.
+        4. None of the above → keep original (will fail at image load
+           but MathDataset has a blank-fallback so training continues).
+
+    Args:
+        sanitized_dir: Directory containing the sanitized .jsonl files.
+        data_dir:      The root directory where images actually live
+                       (e.g. /kaggle/input/.../hf_data).  When unset,
+                       image paths are used as-is.
 
     Returns a dict: {dataset_name: [sample, ...]}
     Missing files are skipped with a warning — training continues on
@@ -145,6 +167,7 @@ def _load_sanitized_samples(sanitized_dir: str) -> Dict[str, List]:
             continue
 
         samples = []
+        missing_count = 0
         with open(fpath, 'r') as f:
             for line in f:
                 line = line.strip()
@@ -152,17 +175,124 @@ def _load_sanitized_samples(sanitized_dir: str) -> Dict[str, List]:
                     continue
                 try:
                     s = json.loads(line)
-                    s['dataset_name'] = ds_name  # ensure tag is present
-                    samples.append(s)
                 except json.JSONDecodeError:
                     continue
 
+                s['dataset_name'] = ds_name  # ensure tag is present
+
+                # ── Resolve image path ────────────────────────────
+                img = s.get('image') or s.get('image_path', '')
+                if img and isinstance(img, str):
+                    resolved = _resolve_image_path(img, data_dir, sanitized_dir)
+                    if resolved:
+                        s['image'] = resolved
+                        s.pop('image_path', None)
+                    else:
+                        missing_count += 1
+                        continue  # drop samples with unfindable images
+
+                samples.append(s)
+
+        if missing_count > 0:
+            logger.warning(
+                f"  {ds_name}: {missing_count:,} samples dropped "
+                f"(image not found after path resolution)"
+            )
         logger.info(
             f"  Loaded sanitized {ds_name}: {len(samples):,} samples"
         )
         all_processed[ds_name] = samples
 
     return all_processed
+
+
+def _resolve_image_path(
+    img_path: str,
+    data_dir: str,
+    sanitized_dir: str,
+) -> str:
+    """
+    Try to resolve an image path to an existing file on disk.
+
+    Returns the resolved absolute path, or empty string if not found.
+    """
+    if not img_path:
+        return ""
+
+    # 1. Already absolute and exists
+    if os.path.isabs(img_path) and os.path.exists(img_path):
+        return img_path
+
+    # 2. Relative to data_dir (most common case)
+    if data_dir:
+        candidate = os.path.join(data_dir, img_path.replace('\\', '/'))
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+        # Also try without slash normalisation
+        candidate2 = os.path.join(data_dir, img_path)
+        if os.path.exists(candidate2):
+            return os.path.abspath(candidate2)
+
+    # 3. Relative to sanitized_dir
+    candidate = os.path.join(sanitized_dir, img_path.replace('\\', '/'))
+    if os.path.exists(candidate):
+        return os.path.abspath(candidate)
+
+    # 4. Stale absolute path — try suffix matching against data_dir
+    if os.path.isabs(img_path) and data_dir:
+        from pathlib import Path as _Path
+        parts = _Path(img_path).parts
+        for i in range(len(parts)):
+            suffix = os.path.join(*parts[i:])
+            candidate = os.path.join(data_dir, suffix)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+
+    # Nothing worked
+    return ""
+
+
+def _find_image_root(*candidates: str) -> str:
+    """
+    Auto-discover the directory that contains the actual image
+    subdirectories (crohme/, hme100k/, im2latex/).
+
+    Checks each candidate path first.  If none of them contain image
+    subdirs, falls back to scanning /kaggle/input/ (the standard
+    Kaggle dataset mount) up to depth 6.
+
+    Returns the discovered path, or empty string if nothing found.
+    """
+    # Known subdirectories that indicate this is the image root
+    _MARKER_DIRS = {"crohme", "hme100k", "im2latex"}
+
+    def _has_image_subdirs(path: str) -> bool:
+        if not path or not os.path.isdir(path):
+            return False
+        try:
+            entries = set(os.listdir(path))
+        except OSError:
+            return False
+        # At least 2 of 3 marker dirs must be present
+        return len(_MARKER_DIRS & entries) >= 2
+
+    # 1. Check explicit candidates
+    for c in candidates:
+        if _has_image_subdirs(c):
+            return c
+
+    # 2. Scan /kaggle/input/ (standard Kaggle mount)
+    kaggle_input = "/kaggle/input"
+    if os.path.isdir(kaggle_input):
+        for dirpath, dirnames, _ in os.walk(kaggle_input):
+            depth = dirpath.replace(kaggle_input, "").count(os.sep)
+            if depth > 6:
+                dirnames.clear()  # stop descending
+                continue
+            if _has_image_subdirs(dirpath):
+                return dirpath
+
+    return ""
 
 
 class Trainer:
@@ -303,7 +433,37 @@ class Trainer:
                 f"✅ Fast path: loading sanitized JSONL files from "
                 f"{sdir}"
             )
-            all_processed = _load_sanitized_samples(sdir)
+
+            # ── Find the real image root ───────────────────────────
+            # config.data_dir may point to the sanitized JSONL folder
+            # (e.g. /kaggle/working/sanitized_processed) rather than
+            # the original hf_data folder where images actually live
+            # (e.g. /kaggle/input/.../hf_data).
+            #
+            # We auto-discover the image root by checking, in order:
+            #   1. config.data_dir   — if it contains image subdirs
+            #   2. config.data_root  — same check
+            #   3. /kaggle/input/    — recursive scan (max depth 6)
+            image_root = _find_image_root(
+                self.config.data_dir,
+                getattr(self.config, 'data_root', ''),
+            )
+            if image_root:
+                self.logger.info(
+                    f"  Image root discovered: {image_root}"
+                )
+            else:
+                self.logger.warning(
+                    "  Could not auto-discover image root — "
+                    "image paths may fail to resolve. "
+                    "Set config.data_dir to the folder containing "
+                    "crohme/, hme100k/, im2latex/ subdirs."
+                )
+                image_root = self.config.data_dir
+
+            all_processed = _load_sanitized_samples(
+                sdir, data_dir=image_root
+            )
 
             # ── Tokenizer load — FIXED ─────────────────────────────
             # LaTeXTokenizer.load() is an INSTANCE method, not a
