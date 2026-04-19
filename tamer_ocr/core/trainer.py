@@ -148,6 +148,13 @@ def _load_sanitized_samples(
     the datasets that ARE present.
     """
     import json
+    import pickle
+
+    cache_file = os.path.join(sanitized_dir, "resolved_samples_cache.pkl")
+    if os.path.exists(cache_file):
+        logger.info(f"✅ Fast path: loading fully resolved samples from {cache_file}")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
 
     dataset_files = {
         "crohme":      "crohme.jsonl",
@@ -203,7 +210,15 @@ def _load_sanitized_samples(
         )
         all_processed[ds_name] = samples
 
+    logger.info(f"💾 Caching resolved dictionary to {cache_file} for instant loads...")
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(all_processed, f)
+    except Exception as e:
+        logger.warning(f"Failed to cache solved dictionary: {e}")
+
     return all_processed
+
 
 
 def _resolve_image_path(

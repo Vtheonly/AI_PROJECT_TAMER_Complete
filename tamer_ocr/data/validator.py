@@ -75,6 +75,11 @@ def validate_before_training(config, train_samples: List[Dict], val_samples: Lis
     Ensures the pipeline won't crash 10 hours in due to a missing folder.
     """
     logger.info("Performing pre-training integrity check...")
+
+    cache_flag = os.path.join(getattr(config, 'output_dir', ''), "validation_passed.flag")
+    if os.path.exists(cache_flag):
+        logger.info("✅ Pre-training integrity check PASSED previously (cache found). Skipping.")
+        return True
     
     # 1. Check Directories
     for path_attr in ['data_dir', 'checkpoint_dir', 'output_dir']:
@@ -96,4 +101,13 @@ def validate_before_training(config, train_samples: List[Dict], val_samples: Lis
         return False
 
     logger.info(f"Integrity check passed (Train readability: {train_val['valid']}/{train_val['total_checked']})")
+    
+    # Cache the success
+    try:
+        os.makedirs(os.path.dirname(cache_flag), exist_ok=True)
+        with open(cache_flag, 'w') as f:
+            f.write("OK")
+    except Exception:
+        pass
+        
     return True
