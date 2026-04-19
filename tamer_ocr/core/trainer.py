@@ -111,6 +111,54 @@ def _unwrap_model(model: nn.Module) -> TAMERModel:
 # Helper: load sanitized JSONL files (all 4 datasets)
 # ---------------------------------------------------------------------------
 
+
+
+def _resolve_image_path(
+    img_path: str,
+    data_dir: str,
+    sanitized_dir: str,
+) -> str:
+    """
+    Try to resolve an image path to an existing file on disk.
+
+    Returns the resolved absolute path, or empty string if not found.
+    """
+    if not img_path:
+        return ""
+
+    # 1. Already absolute and exists
+    if os.path.isabs(img_path) and os.path.exists(img_path):
+        return img_path
+
+    # 2. Relative to data_dir (most common case)
+    if data_dir:
+        candidate = os.path.join(data_dir, img_path.replace('\\', '/'))
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+        # Also try without slash normalisation
+        candidate2 = os.path.join(data_dir, img_path)
+        if os.path.exists(candidate2):
+            return os.path.abspath(candidate2)
+
+    # 3. Relative to sanitized_dir
+    candidate = os.path.join(sanitized_dir, img_path.replace('\\', '/'))
+    if os.path.exists(candidate):
+        return os.path.abspath(candidate)
+
+    # 4. Stale absolute path — try suffix matching against data_dir
+    if os.path.isabs(img_path) and data_dir:
+        from pathlib import Path as _Path
+        parts = _Path(img_path).parts
+        for i in range(len(parts)):
+            suffix = os.path.join(*parts[i:])
+            candidate = os.path.join(data_dir, suffix)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+
+    # Nothing worked
+    return ""
+
+
 def _load_sanitized_samples(
     sanitized_dir: str,
     data_dir: str = "",
@@ -118,7 +166,7 @@ def _load_sanitized_samples(
     """
     Load pre-sanitized JSONL files from sanitized_dir.
 
-    Expects the following files (produced by Cell 2.5):
+    Expects the following files (produced by Cell 3):
       crohme.jsonl
       hme100k.jsonl
       im2latex.jsonl
@@ -137,6 +185,12 @@ def _load_sanitized_samples(
         4. None of the above → keep original (will fail at image load
            but MathDataset has a blank-fallback so training continues).
 
+    Caching:
+      The resolved dictionary is cached to resolved_samples_cache.pkl.
+      The cache is invalidated if any source JSONL file has a newer
+      mtime than the cache file — handles re-sanitization without manual
+      cache deletion.
+
     Args:
         sanitized_dir: Directory containing the sanitized .jsonl files.
         data_dir:      The root directory where images actually live
@@ -151,10 +205,6 @@ def _load_sanitized_samples(
     import pickle
 
     cache_file = os.path.join(sanitized_dir, "resolved_samples_cache.pkl")
-    if os.path.exists(cache_file):
-        logger.info(f"✅ Fast path: loading fully resolved samples from {cache_file}")
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
 
     dataset_files = {
         "crohme":      "crohme.jsonl",
@@ -163,6 +213,28 @@ def _load_sanitized_samples(
         "mathwriting": "mathwriting.jsonl",
     }
 
+    # Build list of existing source files with their paths.
+    source_files = [
+        os.path.join(sanitized_dir, fname)
+        for fname in dataset_files.values()
+        if os.path.exists(os.path.join(sanitized_dir, fname))
+    ]
+
+    # Check cache validity: cache exists and is newer than all source files.
+    cache_is_valid = False
+    if os.path.exists(cache_file) and source_files:
+        cache_mtime = os.path.getmtime(cache_file)
+        if all(os.path.getmtime(src) <= cache_mtime for src in source_files):
+            cache_is_valid = True
+        else:
+            logger.info("Source JSONL files changed since last cache — rebuilding.")
+
+    if cache_is_valid:
+        logger.info(f"Loading resolved samples from cache: {cache_file}")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    # Cache miss or invalid — rebuild from source.
     all_processed = {}
 
     for ds_name, filename in dataset_files.items():
@@ -185,9 +257,9 @@ def _load_sanitized_samples(
                 except json.JSONDecodeError:
                     continue
 
-                s['dataset_name'] = ds_name  # ensure tag is present
+                s['dataset_name'] = ds_name
 
-                # ── Resolve image path ────────────────────────────
+                # Resolve image path.
                 img = s.get('image') or s.get('image_path', '')
                 if img and isinstance(img, str):
                     resolved = _resolve_image_path(img, data_dir, sanitized_dir)
@@ -196,7 +268,7 @@ def _load_sanitized_samples(
                         s.pop('image_path', None)
                     else:
                         missing_count += 1
-                        continue  # drop samples with unfindable images
+                        continue
 
                 samples.append(s)
 
@@ -210,14 +282,18 @@ def _load_sanitized_samples(
         )
         all_processed[ds_name] = samples
 
-    logger.info(f"💾 Caching resolved dictionary to {cache_file} for instant loads...")
+    # Write cache.
+    logger.info(f"Caching resolved dictionary to {cache_file}")
     try:
         with open(cache_file, 'wb') as f:
             pickle.dump(all_processed, f)
     except Exception as e:
-        logger.warning(f"Failed to cache solved dictionary: {e}")
+        logger.warning(f"Failed to write cache: {e}")
 
     return all_processed
+
+
+
 
 
 
