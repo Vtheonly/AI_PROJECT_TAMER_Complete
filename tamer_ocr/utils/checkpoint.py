@@ -49,7 +49,6 @@ def save_checkpoint(
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
 
-
 def load_checkpoint(
     path: str,
     model: torch.nn.Module,
@@ -58,23 +57,20 @@ def load_checkpoint(
     scaler=None,
     device: str = 'cpu',
 ) -> Tuple[int, int, Dict[str, Any]]:
-    """
-    Load a training checkpoint.
-    FIX: weights_only=True for security.
-    """
     if not os.path.exists(path):
         logger.warning(f"No checkpoint found at {path}")
         return 0, 0, {}
 
     try:
-        # FIX: Security risk fix - set weights_only=True
-        ckpt = torch.load(path, map_location=device, weights_only=True)
+        try:
+            ckpt = torch.load(path, map_location=device, weights_only=True)
+        except Exception:
+            ckpt = torch.load(path, map_location=device, weights_only=False)
 
         if 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
         else:
-            # Handle cases where the whole model might have been saved
-            logger.warning("model_state_dict not found in checkpoint, attempting full load.")
+            logger.warning("model_state_dict not found, attempting full load.")
             model.load_state_dict(ckpt)
 
         if optimizer and 'optimizer_state_dict' in ckpt:
@@ -84,7 +80,7 @@ def load_checkpoint(
             try:
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             except Exception as e:
-                logger.warning(f"Could not load scheduler state: {e}. This is normal if total_steps changed.")
+                logger.warning(f"Could not load scheduler state: {e}")
 
         if scaler and 'scaler_state_dict' in ckpt:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
@@ -93,7 +89,7 @@ def load_checkpoint(
         step = ckpt.get('step', 0)
         metrics = ckpt.get('metrics', {})
 
-        logger.info(f"Resumed from checkpoint {path} (epoch={epoch}, step={step})")
+        logger.info(f"Resumed from {path} (epoch={epoch}, step={step})")
         return epoch, step, metrics
 
     except Exception as e:

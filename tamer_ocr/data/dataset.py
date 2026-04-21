@@ -6,207 +6,147 @@ import cv2
 import logging
 from PIL import Image
 from typing import List, Dict, Any, Union, Optional
-from .tokenizer import LaTeXTokenizer
 
 logger = logging.getLogger("TAMER.Dataset")
 
 
+def preprocess_image(
+    img_source: Union[str, Image.Image],
+    height: int,
+    width: int,
+    transform=None,
+    max_aspect_ratio: float = 10.0,
+) -> torch.Tensor:
+    """
+    Standalone image preprocessing.
+    Used by BOTH training (MathDataset) and inference to guarantee zero mismatch.
+    """
+    target_h, target_w = height, width
+
+    if isinstance(img_source, str):
+        img = Image.open(img_source)
+    elif isinstance(img_source, Image.Image):
+        img = img_source
+    else:
+        raise ValueError(f"Unsupported image type: {type(img_source)}")
+
+    img = img.convert("RGB")
+    arr = np.array(img)
+
+    if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+    else:
+        h, w = arr.shape[:2]
+        aspect_ratio = max(w, h) / max(min(w, h), 1)
+        if aspect_ratio > max_aspect_ratio:
+            canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+        else:
+            img_aspect = w / max(h, 1)
+            if img_aspect < 2.0:
+                scale_h = target_h / h
+                scale_w = target_w / w
+                scale = min(scale_h, scale_w)
+                new_h = min(int(h * scale), target_h)
+                new_w = min(int(w * scale), target_w)
+                arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                y_off = (target_h - new_h) // 2
+                x_off = (target_w - new_w) // 2
+                canvas[y_off : y_off + new_h, x_off : x_off + new_w] = arr
+            else:
+                scale = target_h / h
+                new_w = int(w * scale)
+                if new_w > target_w:
+                    scale = target_w / w
+                    new_h = int(h * scale)
+                    arr = cv2.resize(arr, (target_w, new_h), interpolation=cv2.INTER_AREA)
+                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                    y_offset = (target_h - new_h) // 2
+                    canvas[y_offset : y_offset + new_h, :, :] = arr
+                else:
+                    arr = cv2.resize(arr, (new_w, target_h), interpolation=cv2.INTER_AREA)
+                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                    canvas[:, :new_w, :] = arr
+
+    if transform:
+        canvas = transform(image=canvas)["image"]
+
+    tensor = torch.from_numpy(canvas.astype(np.float32)).permute(2, 0, 1) / 255.0
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    tensor = (tensor - mean) / std
+    return tensor
+
+
 class MathDataset(Dataset):
-    """
-    PyTorch Dataset for math formula recognition.
-    
-    Key design decisions:
-    - Images maintain aspect ratio: height=256, pad width to 1024.
-    - Images use normal ImageNet-style colors (white background, black text).
-    - ImageNet normalization applied (3 channels).
-    - Handles both file paths and PIL Image objects.
-    """
-    def __init__(
-        self,
-        samples: List[Dict[str, Any]],
-        config,
-        tokenizer: LaTeXTokenizer,
-        transform=None,
-    ):
+    def __init__(self, samples, config, tokenizer, transform=None):
         self.samples = samples
         self.config = config
         self.tokenizer = tokenizer
         self.transform = transform
-        
-        # Pre-compute token lengths for filtering if needed
-        self._token_lengths = []
-        for s in self.samples:
-            latex = s.get('latex', '')
-            tokens = self.tokenizer.tokenize(latex)
-            self._token_lengths.append(len(tokens))
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _process_image(self, img_source: Union[str, Image.Image]) -> torch.Tensor:
-        """
-        Process an image with aspect-ratio-preserving resizing.
-
-        v2.3: Adaptive handling for tall (multi-line/matrix) vs wide (single-line) images.
-
-        For WIDE images (aspect >= 2.0, typical single-line formulas):
-          1. Scale height to target_h, pad width to target_w.
-          2. If width overflows, scale to fit width and center vertically.
-
-        For TALL images (aspect < 2.0, multi-line equations/matrices):
-          1. Scale to fit BOTH dimensions (no cropping).
-          2. Center the image both horizontally AND vertically.
-          This preserves vertical row structure instead of squashing it.
-
-        Returns:
-            Tensor of shape (3, H, W) with ImageNet normalization.
-        """
-        target_h = self.config.img_height
-        target_w = self.config.img_width
-
-        # Load image
-        if isinstance(img_source, str):
-            img = Image.open(img_source)
-        elif isinstance(img_source, Image.Image):
-            img = img_source
-        else:
-            raise ValueError(f"Unsupported image type: {type(img_source)}")
-
-        # Convert to true RGB to match Swin pretraining
-        img = img.convert('RGB')
-        arr = np.array(img)
-
-        # Handle edge cases (empty or corrupt images)
-        if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
-            canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-        else:
-            h, w = arr.shape[:2]
-
-            # Aspect ratio filter
-            aspect_ratio = max(w, h) / max(min(w, h), 1)
-            if aspect_ratio > self.config.max_aspect_ratio:
-                canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-            else:
-                img_aspect = w / max(h, 1)
-
-                if img_aspect < 2.0:
-                    # TALL image (multi-line equations, matrices)
-                    # Scale to fit within target dimensions without cropping
-                    scale_h = target_h / h
-                    scale_w = target_w / w
-                    scale = min(scale_h, scale_w)  # fit whichever is tighter
-
-                    new_h = min(int(h * scale), target_h)
-                    new_w = min(int(w * scale), target_w)
-
-                    arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-
-                    # Center both vertically AND horizontally
-                    y_off = (target_h - new_h) // 2
-                    x_off = (target_w - new_w) // 2
-                    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = arr
-                else:
-                    # WIDE image (single-line formulas — existing logic)
-                    scale = target_h / h
-                    new_w = int(w * scale)
-
-                    if new_w > target_w:
-                        # Width overflows: scale to fit width, center vertically
-                        scale = target_w / w
-                        new_h = int(h * scale)
-                        arr = cv2.resize(arr, (target_w, new_h), interpolation=cv2.INTER_AREA)
-                        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-                        y_offset = (target_h - new_h) // 2
-                        canvas[y_offset:y_offset + new_h, :, :] = arr
-                    else:
-                        # Normal case: scale height, pad width on right
-                        arr = cv2.resize(arr, (new_w, target_h), interpolation=cv2.INTER_AREA)
-                        canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-                        canvas[:, :new_w, :] = arr
-
-        # Apply augmentation if provided (e.g., rotation, noise)
-        if self.transform:
-            canvas = self.transform(image=canvas)['image']
-
-        # === Normalization and Tensor Conversion ===
-        # 1. Convert to [0, 1] range and permute to (C, H, W)
-        tensor = torch.from_numpy(canvas.astype(np.float32)).permute(2, 0, 1) / 255.0
-
-        # 2. Apply standard ImageNet Normalization
-        # Mean: [0.485, 0.456, 0.406], Std: [0.229, 0.224, 0.225]
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        tensor = (tensor - mean) / std
-
-        return tensor
+        return preprocess_image(
+            img_source,
+            self.config.img_height,
+            self.config.img_width,
+            transform=self.transform,
+            max_aspect_ratio=getattr(self.config, "max_aspect_ratio", 10.0),
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
+        img_source = sample.get("image") or sample.get("image_path")
+        latex = sample.get("latex", "")
+        dataset_name = sample.get("dataset_name", "unknown")
 
-        img_source = sample.get('image') or sample.get('image_path')
-        latex = sample.get('latex', '')
-        dataset_name = sample.get('dataset_name', 'unknown')
-
-        # Process Image
         try:
             tensor = self._process_image(img_source)
         except Exception as e:
             logger.warning(f"Failed to load image (idx={idx}): {e}")
-            # Return a blank normalized tensor as fallback
-            blank = np.full((self.config.img_height, self.config.img_width, 3), 255, dtype=np.uint8)
-            tensor = torch.from_numpy(blank.astype(np.float32)).permute(2, 0, 1) / 255.0
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            tensor = (tensor - mean) / std
+            tensor = preprocess_image(
+                Image.new("RGB", (self.config.img_width, self.config.img_height), color=(255, 255, 255)),
+                self.config.img_height,
+                self.config.img_width,
+            )
             latex = ""
 
-        # Tokenize label
-        tokens = self.tokenizer.tokenize(latex)[:self.config.max_seq_len - 2]
-        
-        # Add special tokens
+        tokens = self.tokenizer.tokenize(latex)[: self.config.max_seq_len - 2]
         ids = [self.tokenizer.sos_id] + self.tokenizer.encode(tokens) + [self.tokenizer.eos_id]
 
         return {
-            'image': tensor,
-            'ids': torch.tensor(ids, dtype=torch.long),
-            'length': len(ids),
-            'latex': latex,
-            'dataset_name': dataset_name,
+            "image": tensor,
+            "ids": torch.tensor(ids, dtype=torch.long),
+            "length": len(ids),
+            "latex": latex,
+            "dataset_name": dataset_name,
         }
 
 
 def get_collate_fn(pad_id: int):
-    """
-    Standard collate function for batching samples.
-    Pads token sequences to the longest sequence in the batch.
-    """
     def collate_fn(batch):
-        # Filter out invalid samples
-        batch = [x for x in batch if x['length'] > 0]
+        batch = [x for x in batch if x["length"] > 0]
         if not batch:
             return None
 
-        # Stack images into a single tensor (B, 3, H, W)
-        images = torch.stack([x['image'] for x in batch])
-        
-        # Collect metadata
-        lengths = torch.tensor([x['length'] for x in batch])
-        latices = [x['latex'] for x in batch]
-        dataset_names = [x['dataset_name'] for x in batch]
+        images = torch.stack([x["image"] for x in batch])
+        lengths = torch.tensor([x["length"] for x in batch])
+        latices = [x["latex"] for x in batch]
+        dataset_names = [x["dataset_name"] for x in batch]
 
-        # Pad token IDs
         ids = pad_sequence(
-            [x['ids'] for x in batch], 
-            batch_first=True, 
-            padding_value=pad_id
+            [x["ids"] for x in batch], batch_first=True, padding_value=pad_id
         )
 
         return {
-            'image': images,
-            'ids': ids,
-            'length': lengths,
-            'latex': latices,
-            'dataset_name': dataset_names,
+            "image": images,
+            "ids": ids,
+            "length": lengths,
+            "latex": latices,
+            "dataset_name": dataset_names,
         }
+
     return collate_fn
