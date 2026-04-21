@@ -3,6 +3,11 @@ LaTeX Tokenizer for Math OCR Training.
 
 Builds a global vocabulary from all datasets. Special tokens are fixed at indices 0-3.
 
+v2.4 Changes:
+  - FIXED: decode() now uses simple space-joining instead of complex smart-joining rules.
+    The previous "intelligent" parsing caused evaluation failures by producing
+    inconsistent output. Evaluation metrics (exact_match) handle normalization.
+
 v2.3 Changes:
   - FIXED: \\\\ (double backslash / row separator) is now tokenized as a single
     atomic token '\\\\' instead of being split into two backslash commands.
@@ -11,11 +16,6 @@ v2.3 Changes:
   - FIXED: \\begin{env} and \\end{env} are now atomic tokens instead of being
     split into \\begin, {, e, n, v, }. This preserves environment structure
     and prevents the model from hallucinating invalid environments.
-
-  - FIXED: decode() now uses proper LaTeX joining rules:
-    - No space before/after structural characters: { } ( ) [ ] _ ^ & \\\\
-    - Space after LaTeX commands followed by alphanumeric characters
-    - Numbers and dots concatenated when adjacent
 
   - Digit-level tokenization preserved for robustness to unseen numbers.
 """
@@ -87,7 +87,6 @@ class LaTeXTokenizer:
             # which destroys matrix/aligned row structure.
             # ----------------------------------------------------------------
             if i + 1 < n and latex[i] == '\\' and latex[i + 1] == '\\':
-                # Check it's not a longer command like \\\\alpha (very unlikely but safe)
                 if i + 2 >= n or not latex[i + 2].isalpha():
                     tokens.append('\\\\')
                     i += 2
@@ -201,11 +200,9 @@ class LaTeXTokenizer:
 
     def decode(self, indices: List[int], skip_special: bool = True) -> str:
         """
-        Convert a list of integer indices back to a properly formatted LaTeX string.
-
-        Uses smart joining rules to produce valid LaTeX:
-        - No space before/after structural characters
-        - Space where needed to prevent command merging
+        Convert a list of integer indices back to a LaTeX string.
+        Safely joins tokens with a space. The evaluation metrics
+        (exact_match) handle stripping/normalizing spaces for final scoring.
         """
         res = []
         for idx in indices:
@@ -221,52 +218,11 @@ class LaTeXTokenizer:
         if not res:
             return ""
 
-        # Smart concatenation
-        out = ""
-        for i, token in enumerate(res):
-            if i == 0:
-                out += token
-                continue
+        # Just join with a space. It is mathematically safe and
+        # guarantees we don't accidentally merge commands like \alpha b
+        out = ' '.join(res)
 
-            prev = res[i - 1]
-
-            # Never add space before these tokens
-            if token in '{}()[]_^':
-                out += token
-            # Never add space after open brackets (previous token)
-            elif prev in '{([':
-                out += token
-            # & and \\\\ — no space needed (they ARE the separator)
-            elif token == '&':
-                out += ' ' + token + ' '
-            elif token == '\\\\':
-                out += ' ' + token + ' '
-            # Operators get space before
-            elif token in '+-=<>|':
-                # But only if previous wasn't already a space-producing token
-                if out and out[-1] != ' ':
-                    out += ' '
-                out += token
-                if i + 1 < len(res) and res[i + 1] not in '{}()[]_^':
-                    out += ' '
-            # LaTeX commands need space before if previous ends with alnum
-            elif token.startswith('\\'):
-                if out and out[-1].isalnum():
-                    out += ' '
-                out += token
-                # Space after command if next token starts with alnum
-                # to prevent \\alphab merging
-                if i + 1 < len(res) and res[i + 1][0:1].isalnum():
-                    # But NOT if next is { — \\frac{} needs no space
-                    out += ' '
-            # Digits after digits: no space (part of same number)
-            elif (token.isdigit() or token == '.') and (prev.isdigit() or prev == '.'):
-                out += token
-            # Digits/letters after commands: space was already added above
-            else:
-                out += token
-
-        # Clean up any double spaces
+        # Clean up any accidental double spaces
         out = ' '.join(out.split())
         return out
 

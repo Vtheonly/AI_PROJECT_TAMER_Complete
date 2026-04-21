@@ -118,14 +118,16 @@ class Config:
             os.makedirs(path, exist_ok=True)
 
 
-def kaggle_offline_config(
+
+
+def kaggle_offline_max_accuracy_config(
     sanitized_data_dir: str = "/kaggle/input/datasets/merselfares/tamer-sanitized-jsonl",
     data_dir: str = "/kaggle/input/datasets/merselfares/tamer-full-pipeline-v1/hf_data",
     local_backbone_path: str = "/kaggle/input/datasets/merselfares/swinv2-base-weights/model.safetensors",
 ) -> Config:
     """
-    Returns a Config pre-tuned for Kaggle offline training on RTX 6000 Pro.
-    All network access is disabled. All paths point to Kaggle input datasets.
+    ULTIMATE MAXIMUM ACCURACY CONFIG
+    Tuned for RTX 6000 Ada (96GB VRAM) - Offline Mode
     """
     cfg = Config()
     cfg.data_dir = data_dir
@@ -135,47 +137,52 @@ def kaggle_offline_config(
     cfg.checkpoint_dir = "/kaggle/working/checkpoints"
     cfg.log_dir = "/kaggle/working/logs"
 
-    # Hardware: RTX 6000 Pro 96GB VRAM, 170GB RAM
-    cfg.batch_size = 256
-    cfg.accumulation_steps = 2          # Effective 512
-    cfg.num_workers = 4
+    # --- MAXIMUM ACCURACY RESOLUTION ---
+    # 384x1280 allows matrices and fractions to retain crisp structural details
+    cfg.img_height = 384
+    cfg.img_width = 1280
+
+    # --- OOM-SAFE BATCHING FOR 96GB ---
+    # 48 fits safely even with deep backpropagation graphs and compilation
+    cfg.batch_size = 48 
+    cfg.accumulation_steps = 4  # Effective batch size = 192
+    
+    cfg.num_workers = 8 # Utilize Kaggle CPU cores
     cfg.pin_memory = True
     cfg.prefetch_factor = 2
     cfg.persistent_workers = True
     cfg.compile_model = True
 
-    # Conservative LR + long freeze prevents "unfreezing shock"
-    cfg.encoder_lr = 5e-6
-    cfg.decoder_lr = 3e-4
+    # --- LEARNING RATES & REGULARIZATION ---
+    cfg.encoder_lr = 1e-5     # Gentle on the pre-trained Swin features
+    cfg.decoder_lr = 3e-4     
     cfg.weight_decay = 1e-4
     cfg.max_grad_norm = 1.0
     cfg.label_smoothing = 0.1
-    cfg.freeze_encoder_epochs = 10
+    
+    # 15 epochs gives the decoder time to align with the massive encoder before unfreezing
+    cfg.freeze_encoder_epochs = 15
 
-    # Training schedule
+    # --- TRAINING SCHEDULE ---
     cfg.num_epochs = 70
     cfg.early_stopping_patience = 20
-    cfg.eval_every = 2
-    cfg.eval_warmup_epochs = 10
-    cfg.eval_warmup_max_samples = 500
+    cfg.eval_every = 1        # Validate every epoch to catch spikes early
     cfg.checkpoint_every_epochs = 1
-    cfg.keep_last_n_checkpoints = 5
-
-    # Curriculum
+    cfg.keep_last_n_checkpoints = 3
+    
+    # --- CURRICULUM & LOSS ---
     cfg.curriculum_enabled = True
-    cfg.curriculum_simple_until = 15
-    cfg.curriculum_medium_until = 30
-
-    # Loss
+    cfg.curriculum_simple_until = 10
+    cfg.curriculum_medium_until = 25
     cfg.structure_aware_loss = True
-    cfg.structural_token_weight = 3.0
+    cfg.structural_token_weight = 4.0 # Heavily penalize broken row/col separators
 
-    # Offline / no internet
+    # --- STRICT OFFLINE SETTINGS ---
     cfg.auto_download = False
     cfg.hf_token = ""
     cfg.hf_repo_id = ""
-    cfg.hf_dataset_repo_id = ""
 
+    import os
     for d in [cfg.output_dir, cfg.checkpoint_dir, cfg.log_dir]:
         os.makedirs(d, exist_ok=True)
 
