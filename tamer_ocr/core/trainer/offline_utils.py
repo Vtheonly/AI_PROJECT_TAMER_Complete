@@ -23,49 +23,82 @@ _DATASET_FILES = {
 
 _MARKER_DIRS = {"crohme", "hme100k", "im2latex"}
 
+# Global O(1) lookup table to bypass Kaggle's slow Network File System (NFS).
+# The old code called os.path.exists() ~1.5 million times against the NFS,
+# causing 10-15 minute freezes. A single os.walk + dict eliminates that entirely.
+_FILENAME_INDEX: Dict[str, str] = {}
+_INDEX_BUILT: bool = False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Path Resolution
 # ──────────────────────────────────────────────────────────────────────
 
-def _resolve_image_path(img_path: str, data_dir: str, sanitized_dir: str) -> str:
+def _build_filename_index(data_dir: str) -> None:
     """
-    Attempt to locate an image file using several heuristics.
+    Traverse data_dir exactly once with os.walk and build a flat
+    dictionary mapping  basename -> absolute_path  for every image file.
 
-    Resolution order:
-      1. Absolute path that already exists on disk.
-      2. Relative to data_dir (forward + original separators).
-      3. Relative to sanitized_dir.
-      4. Walk the suffix tree of an absolute path against data_dir
-         (handles stale /kaggle/input/old-dataset/... absolute paths).
+    This is called once before any JSONL is parsed.  All subsequent
+    lookups are O(1) dict hits — no further NFS traffic.
+    """
+    global _INDEX_BUILT, _FILENAME_INDEX
+    if _INDEX_BUILT or not data_dir or not os.path.exists(data_dir):
+        return
 
-    Returns the resolved absolute path, or "" if not found.
+    logger.info(
+        f"Building fast O(1) filename index for '{data_dir}' "
+        f"to bypass slow Kaggle NFS ..."
+    )
+
+    for root, _, files in os.walk(data_dir):
+        for f in files:
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                # If two datasets share an identical basename the last one
+                # wins, but cross-dataset basename collisions are very rare
+                # for these specific subsets.
+                _FILENAME_INDEX[f] = os.path.join(root, f)
+
+    _INDEX_BUILT = True
+    logger.info(f"Index built: {len(_FILENAME_INDEX):,} images mapped instantly.")
+
+
+def _resolve_image_path(img_path: str, data_dir: str) -> str:
+    """
+    Locate an image file with zero NFS ping storms.
+
+    Resolution order
+    ────────────────
+    1. Absolute path that already exists on disk  →  return as-is.
+    2. O(1) basename lookup in the pre-built filename index  →  instant.
+    3. Direct join of the relative tail against data_dir  →  safety net.
+
+    Returns the resolved absolute path, or "" when the file cannot be found.
+
+    NOTE: The old 'suffix-tree' fallback (step 4 in the previous version)
+    that iterated over every path prefix with os.path.exists() has been
+    removed.  It was responsible for ~1.5 M NFS round-trips and the
+    10-15 minute freeze described in the article.  The filename index
+    covers that use-case instantly.
     """
     if not img_path:
         return ""
 
-    # 1. Already a valid absolute path.
+    # 1. Already a valid absolute path — nothing to resolve.
     if os.path.isabs(img_path) and os.path.exists(img_path):
         return img_path
 
-    # 2. Relative to data_dir.
+    # 2. O(1) lookup by exact basename (covers stale Windows/Linux absolute
+    #    paths from the sanitisation machine — the common failure case).
+    basename = os.path.basename(img_path.replace("\\", "/"))
+    if basename in _FILENAME_INDEX:
+        return _FILENAME_INDEX[basename]
+
+    # 3. Direct relative-path join against data_dir (safety net for paths
+    #    that are genuinely relative and not yet in the index).
     if data_dir:
-        for sep_normalised in (img_path.replace("\\", "/"), img_path):
-            candidate = os.path.join(data_dir, sep_normalised)
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
-
-    # 3. Relative to sanitized_dir.
-    candidate = os.path.join(sanitized_dir, img_path.replace("\\", "/"))
-    if os.path.exists(candidate):
-        return os.path.abspath(candidate)
-
-    # 4. Walk suffix tree of a stale absolute path against data_dir.
-    if os.path.isabs(img_path) and data_dir:
-        parts = Path(img_path).parts
-        for i in range(len(parts)):
-            suffix = os.path.join(*parts[i:])
-            candidate = os.path.join(data_dir, suffix)
+        for normalised in (img_path.replace("\\", "/"), img_path):
+            candidate = os.path.join(data_dir, normalised)
             if os.path.exists(candidate):
                 return os.path.abspath(candidate)
 
@@ -80,7 +113,7 @@ def _find_image_root(*candidates: str) -> str:
     Checks explicit candidates first, then walks /kaggle/input up to
     depth 6 to avoid traversing the entire filesystem.
 
-    Returns the first matching path, or "" if none found.
+    Returns the first matching path, or "" if none is found.
     """
 
     def _has_image_subdirs(path: str) -> bool:
@@ -117,21 +150,38 @@ def load_sanitized_samples(sanitized_dir: str, data_dir: str = "") -> Dict[str, 
     """
     Load pre-sanitized JSONL files from ``sanitized_dir``.
 
-    A pickle cache (``resolved_samples_cache.pkl``) is written alongside
-    the JSONL files so subsequent runs skip expensive path resolution.
-    The cache is invalidated automatically when any source JSONL is
+    Two critical bugs from the original version are fixed here:
+
+    Bug 1 — NFS freeze
+        The old ``_resolve_image_path`` walked a suffix tree and called
+        ``os.path.exists()`` up to 6 times per image.  With ~250 k images
+        that is 1.5 M NFS round-trips → 10-15 minute hang.
+        Fix: ``_build_filename_index`` does a single ``os.walk`` before
+        parsing begins; every lookup is then an O(1) dict access.
+
+    Bug 2 — Silent cache failure
+        The old code wrote the cache to
+        ``<sanitized_dir>/resolved_samples_cache.pkl``.
+        ``sanitized_dir`` lives inside ``/kaggle/input/`` which is
+        strictly read-only.  The write silently raised
+        ``[Errno 30] Read-only file system``, the cache was never saved,
+        and the 15-minute freeze repeated on every kernel restart.
+        Fix: write the cache to ``/kaggle/working/`` which is writable.
+
+    The cache is invalidated automatically whenever any source JSONL is
     newer than the cache file.
 
     Args:
-        sanitized_dir: Directory containing the ``*.jsonl`` files and
-                       the optional ``resolved_samples_cache.pkl``.
-        data_dir:      Root to search for relative image paths.
+        sanitized_dir: Directory that contains the ``*.jsonl`` files.
+        data_dir:      Root directory used to resolve relative image paths.
 
     Returns:
-        Dict mapping dataset name → list of sample dicts.  Each sample
-        dict has an ``"image"`` key containing a resolved absolute path.
+        Dict mapping dataset name → list of sample dicts.  Each dict has
+        an ``"image"`` key holding a resolved absolute path.
     """
-    cache_file = os.path.join(sanitized_dir, "resolved_samples_cache.pkl")
+    # FIX (Bug 2): use /kaggle/working/ so the cache is actually written.
+    cache_dir  = "/kaggle/working" if os.path.isdir("/kaggle/working") else sanitized_dir
+    cache_file = os.path.join(cache_dir, "resolved_samples_cache.pkl")
 
     source_files = [
         os.path.join(sanitized_dir, fname)
@@ -149,6 +199,9 @@ def load_sanitized_samples(sanitized_dir: str, data_dir: str = "") -> Dict[str, 
                     return pickle.load(fh)
             except Exception as exc:
                 logger.warning(f"Cache read failed ({exc}) — rebuilding.")
+
+    # FIX (Bug 1): build the O(1) index once before touching any JSONL.
+    _build_filename_index(data_dir)
 
     # ── Parse JSONL files ─────────────────────────────────────────────
     all_processed: Dict[str, List] = {}
@@ -177,7 +230,7 @@ def load_sanitized_samples(sanitized_dir: str, data_dir: str = "") -> Dict[str, 
 
                 img = sample.get("image") or sample.get("image_path", "")
                 if img and isinstance(img, str):
-                    resolved = _resolve_image_path(img, data_dir, sanitized_dir)
+                    resolved = _resolve_image_path(img, data_dir)
                     if resolved:
                         sample["image"] = resolved
                         sample.pop("image_path", None)
@@ -188,17 +241,20 @@ def load_sanitized_samples(sanitized_dir: str, data_dir: str = "") -> Dict[str, 
                 samples.append(sample)
 
         if missing_count:
-            logger.warning(f"  {ds_name}: {missing_count:,} samples dropped (image not found)")
+            logger.warning(
+                f"  {ds_name}: {missing_count:,} samples dropped (image not found)"
+            )
 
         logger.info(f"  Loaded {ds_name}: {len(samples):,} samples")
         all_processed[ds_name] = samples
 
-    # ── Write cache ───────────────────────────────────────────────────
+    # ── Write cache to writable location ──────────────────────────────
     logger.info(f"Caching resolved samples → {cache_file}")
     try:
         with open(cache_file, "wb") as fh:
             pickle.dump(all_processed, fh)
+        logger.info("Cache saved successfully.")
     except Exception as exc:
-        logger.warning(f"Failed to write cache (read-only FS?): {exc}")
+        logger.warning(f"Failed to write cache: {exc}")
 
     return all_processed
