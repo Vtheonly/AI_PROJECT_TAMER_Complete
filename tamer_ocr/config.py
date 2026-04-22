@@ -118,9 +118,7 @@ class Config:
             os.makedirs(path, exist_ok=True)
 
 
-
-
-def kaggle_offline_max_accuracy_config(
+def kaggle_offline_config(
     sanitized_data_dir: str = "/kaggle/input/datasets/merselfares/tamer-sanitized-jsonl",
     data_dir: str = "/kaggle/input/datasets/merselfares/tamer-full-pipeline-v1/hf_data",
     local_backbone_path: str = "/kaggle/input/datasets/merselfares/swinv2-base-weights/model.safetensors",
