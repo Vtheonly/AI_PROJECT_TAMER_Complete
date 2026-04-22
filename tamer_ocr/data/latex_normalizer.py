@@ -76,49 +76,63 @@ DISCARD_PATTERNS = [
 #   - Epochs 36+:   + COMPLEX (matrices, arrays — 2D grids)
 # ----------------------------------------------------------------
 
-COMPLEX_PATTERNS = [
-    r'\\begin\s*\{array\}',
-    r'\\begin\s*\{matrix\}',
-    r'\\begin\s*\{pmatrix\}',
-    r'\\begin\s*\{bmatrix\}',
-    r'\\begin\s*\{vmatrix\}',
-    r'\\begin\s*\{Vmatrix\}',
-    r'\\begin\s*\{smallmatrix\}',
-]
 
-MEDIUM_PATTERNS = [
-    r'\\begin\s*\{aligned\}',
-    r'\\begin\s*\{align\}',
-    r'\\begin\s*\{cases\}',
-    r'\\begin\s*\{gathered\}',
-    r'\\begin\s*\{split\}',
-    r'\\begin\s*\{eqnarray\}',
-    r'\\begin\s*\{multline\}',
-    r'\\\\',                      # double backslash (row separator) outside environments
-]
-
+# ----------------------------------------------------------------
+# Complexity Classification for Curriculum Learning
+# ----------------------------------------------------------------
 
 def get_complexity(latex: str) -> str:
     """
-    Classify a LaTeX string by structural complexity.
-
-    Returns:
-        'complex' — contains matrices or arrays (2D grid structure)
-        'medium'  — contains aligned, cases, or row separators (multi-line)
-        'simple'  — single-line formula
+    Classify a LaTeX string by calculating a structural difficulty score.
     """
     if not latex:
         return 'simple'
 
-    for pattern in COMPLEX_PATTERNS:
-        if re.search(pattern, latex):
-            return 'complex'
+    # 1. IMMEDIATE COMPLEX TRIGGERS (2D Grids, Matrices, Multi-line)
+    # Any of these instantly makes it 'complex' because it breaks 1D left-to-right reading.
+    complex_keywords = [
+        'matrix', 'array', 'aligned', 'align', 'cases', 
+        'gathered', 'split', 'eqnarray', 'multline', 
+        '\\\\', '&'
+    ]
+    if any(kw in latex for kw in complex_keywords):
+        return 'complex'
 
-    for pattern in MEDIUM_PATTERNS:
-        if re.search(pattern, latex):
-            return 'medium'
+    # 2. CALCULATE STRUCTURAL SCORE
+    score = 0.0
+    
+    # A. Length penalty: Longer sequences stress the attention matrix
+    # +1 point for every 25 characters
+    score += len(latex) / 25.0
 
-    return 'simple'
+    # B. Spatial shifts: Up/Down reading
+    # +1 point for every superscript or subscript
+    score += latex.count('^') * 1.0
+    score += latex.count('_') * 1.0
+
+    # C. Vertical / Heavy mathematical structures
+    # +2 points each
+    score += latex.count('\\frac') * 2.0
+    score += latex.count('\\sqrt') * 2.0
+    score += latex.count('\\int') * 2.0
+    score += latex.count('\\sum') * 2.0
+    score += latex.count('\\prod') * 2.0
+    score += latex.count('\\lim') * 2.0
+    
+    # D. Grouping depth (approximated by number of opening brackets)
+    # +0.5 points each
+    score += latex.count('{') * 0.5 
+
+    # 3. CLASSIFY BASED ON SCORE
+    # Score < 4: Very basic math (e.g., "x^2 + y = 3") -> Simple
+    # Score 4 to 12: Standard high school / college math -> Medium
+    # Score > 12: Heavily nested/long nightmare math -> Complex
+    if score < 4.0:
+        return 'simple'
+    elif score < 12.0:
+        return 'medium'
+    else:
+        return 'complex'
 
 
 def should_discard(latex: str) -> bool:
