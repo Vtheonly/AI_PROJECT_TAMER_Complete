@@ -49,7 +49,9 @@ class Trainer(
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_amp = self.device.type == "cuda"
-
+        
+        
+        
         # ── Logging ───────────────────────────────────────────────────
         self.logger = setup_logger("TAMER.Trainer", config.log_dir)
         self.logger.info(f"Device : {self.device} | AMP : {self.use_amp}")
@@ -94,6 +96,13 @@ class Trainer(
         # ── HF push tracking ─────────────────────────────────────────
         self._last_hf_push_epoch = -1
 
+
+
+        
+        # Register the signal handlers for SIGTERM (Kaggle timeout) and SIGINT (Ctrl+C)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        self._stop_requested = False
     # ──────────────────────────────────────────────────────────────────
     # Pipeline entry points
     # ──────────────────────────────────────────────────────────────────
@@ -158,7 +167,9 @@ class Trainer(
                     f"Batch tensor: shape={tuple(images.shape)} | "
                     f"dtype={images.dtype}"
                 )
-
+    def _signal_handler(self, sig, frame):
+        self.logger.warning(f"Signal {sig} received! Attempting emergency save...")
+        self._stop_requested = True
 
 # Re-export so `from tamer_ocr.core.trainer import Trainer` works.
 __all__ = ["Trainer"]
