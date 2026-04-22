@@ -46,10 +46,7 @@ Thumbs.db
 # TAMER Specific - Ignore large data and model weights
 # We ignore the directories, but NOT the specific .json extension 
 # to ensure tokenizer.json can be tracked.
-data/
-checkpoints/
-logs/
-outputs/
+
 
 # Re-include specific important files if they are inside ignored dirs
 !data/processed/tokenizer.json
