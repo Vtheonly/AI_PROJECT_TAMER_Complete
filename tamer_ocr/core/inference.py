@@ -1,13 +1,12 @@
+
 """
 Greedy and Beam Search inference for the TAMER model.
 
-v2.0 Changes (Encoder Padding Mask Edition):
-  - [FIXED] Both greedy_decode() and beam_search() now accept optional
-    real_ws / real_hs tensors and pass them through model.encode() so the
-    encoder padding mask is active during inference, matching training exactly.
-  - [RETAINED] @torch.compiler.disable on all public functions.
-  - [RETAINED] KV-Cache O(N^2) decoding path.
-  - [RETAINED] Eager O(N^3) fallback for legacy decoders.
+v2.1 Changes (Fix KV-Cache bugs):
+  - [FIXED] beam_search() now correctly defaults to the eager O(N^3) SDPA path
+    to avoid complex caching mechanics required for beam management. SDPA is
+    extremely fast for short generation lengths anyway.
+  - [RETAINED] greedy_decode() KV-Cache for ultra-fast batch decoding.
 """
 
 import torch
@@ -190,7 +189,9 @@ def beam_search(
     beams: List[tuple] = [([sos_id], 0.0)]
     completed: List[tuple] = []
 
-    use_cache = _has_kv_cache(model)
+    # Force eager path for beam search to avoid complex KV cache beam indexing.
+    # SDPA is extremely fast for small sequence lengths anyway.
+    use_cache = False 
 
     for step in range(max_len):
         if not beams:
@@ -224,35 +225,10 @@ def beam_search(
             batched_memory_mask = memory_mask.expand(num_active, -1)  # (num_active, S)
 
         if use_cache:
-            # Per-beam forward with KV cache warm-up.
-            # Each beam maintains its own independent KV cache.
-            logits_list = []
-            for b_idx in range(num_active):
-                b_ids = tgt_ids[b_idx : b_idx + 1]         # (1, L)
-                b_mem = batched_memory[b_idx : b_idx + 1]  # (1, S, D)
-                b_mask = (
-                    batched_memory_mask[b_idx : b_idx + 1]
-                    if batched_memory_mask is not None
-                    else None
-                )
-
-                # Warm-up a fresh cache by running the full prefix.
-                # This is correct (not O(N^3)) because we do it once per beam
-                # per step, not once per token per beam.
-                b_logits, _ = model.decoder(
-                    b_ids, b_mem,
-                    tgt_mask=None,
-                    memory_mask=b_mask,
-                    use_cache=True,
-                    past_cache={},
-                    step=len(active_beams[b_idx][0]) - 1,
-                )
-                logits_list.append(b_logits[:, -1, :])  # (1, vocab)
-
-            next_logits = torch.cat(logits_list, dim=0)  # (num_active, vocab)
-
+            # Replaced with use_cache=False above.
+            pass
         else:
-            # Legacy O(N^3) eager path
+            # O(N^3) eager path
             L = tgt_ids.size(1)
             tgt_mask = model.decoder.generate_causal_mask(L, device)
             logits = model.decoder(
@@ -288,4 +264,4 @@ def beam_search(
         completed.append((tokens, score / (max(n, 1) ** length_penalty)))
 
     completed.sort(key=lambda x: x[1], reverse=True)
-    return _postprocess(completed[0][0], sos_id, eos_id)
+    return _postprocess(completed[0][0], sos_id, eos_id)    

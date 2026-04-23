@@ -1,16 +1,12 @@
+
 """
 KV-Cached Transformer Decoder for Math OCR.
 
-v2.0 Changes (Encoder Padding Mask Edition):
-  - [FIXED] DecoderBlock.forward() now accepts memory_mask and passes it to
-    cross_attn so blank image-padding tokens are completely ignored.
-  - [FIXED] TransformerDecoder.forward() accepts memory_mask, converts the
-    PyTorch-style bool mask (True=ignore) into an SDPA-compatible additive
-    float mask (-inf on ignored positions) and propagates it into every block.
-  - [FIXED] KVCachedAttention handles 4-D boolean masks from cross-attention
-    correctly alongside 2-D causal float masks from self-attention.
-  - [RETAINED] KV-Cache for O(N^2) inference.
-  - [RETAINED] @use_kv_cache_flag sentinel for inference.py auto-detection.
+v2.1 Changes (Fix KV-Cache for Cross Attention):
+  - [FIXED] KVCachedAttention now correctly identifies cross-attention (where K/V
+    come from the static encoder memory) and calculates/caches K and V exactly
+    once, rather than incorrectly concatenating them every step.
+  - [RETAINED] Encoder Padding Mask propagation via memory_mask.
   - [RETAINED] Pre-norm architecture.
 """
 
@@ -75,10 +71,8 @@ class KVCachedAttention(nn.Module):
         """
         B, L_q, _ = query.shape
 
-        # Linear projections
+        # Linear projections for query
         q = self.q_proj(query)   # (B, L_q, D)
-        k = self.k_proj(key)     # (B, L_k, D)
-        v = self.v_proj(value)   # (B, L_k, D)
 
         # Split into heads: (B, nhead, L, head_dim)
         def _split_heads(t: torch.Tensor) -> torch.Tensor:
@@ -86,16 +80,34 @@ class KVCachedAttention(nn.Module):
             return t.view(B_, L_, self.nhead, self.head_dim).transpose(1, 2)
 
         q = _split_heads(q)
-        k = _split_heads(k)
-        v = _split_heads(v)
 
-        # KV Cache: grow K and V with previously cached tokens
+        # Check if we are doing cross-attention (where K/V are static encoder features)
+        is_cross_attn = cache_key is not None and cache_key.startswith("cross")
+
         if cache is not None and cache_key is not None:
-            if cache_key in cache:
-                past_k, past_v = cache[cache_key]
-                k = torch.cat([past_k, k], dim=2)
-                v = torch.cat([past_v, v], dim=2)
-            cache[cache_key] = (k, v)
+            if is_cross_attn:
+                # Cross-attention: K and V represent the entire memory.
+                # Compute them exactly once at step 0 and reuse for all future steps.
+                if cache_key in cache:
+                    k, v = cache[cache_key]
+                else:
+                    k = _split_heads(self.k_proj(key))
+                    v = _split_heads(self.v_proj(value))
+                    cache[cache_key] = (k, v)
+            else:
+                # Self-attention: K and V represent the newest token.
+                # Compute them and concatenate with the historical context.
+                k = _split_heads(self.k_proj(key))
+                v = _split_heads(self.v_proj(value))
+                if cache_key in cache:
+                    past_k, past_v = cache[cache_key]
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+                cache[cache_key] = (k, v)
+        else:
+            # No caching (e.g. training path)
+            k = _split_heads(self.k_proj(key))
+            v = _split_heads(self.v_proj(value))
 
         # Normalise mask to additive float for SDPA
         # SDPA expects: 0.0 = attend, -inf = block, shape broadcastable to
