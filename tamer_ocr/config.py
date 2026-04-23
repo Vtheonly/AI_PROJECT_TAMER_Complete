@@ -141,8 +141,8 @@ def kaggle_offline_config(
 
     # --- OOM-SAFE BATCHING FOR 96GB ---
     # 48 fits safely even with deep backpropagation graphs and compilation
-    cfg.batch_size = 32 
-    cfg.accumulation_steps = 8  # Effective batch size = 192
+    cfg.batch_size = 96 
+    cfg.accumulation_steps = 2  # Effective batch size = 192
     
     cfg.num_workers = 10 # Utilize Kaggle CPU cores
     cfg.pin_memory = True
@@ -183,4 +183,4 @@ def kaggle_offline_config(
     for d in [cfg.output_dir, cfg.checkpoint_dir, cfg.log_dir]:
         os.makedirs(d, exist_ok=True)
 
-    return cfg
+    return cfg  
