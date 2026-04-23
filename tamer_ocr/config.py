@@ -69,7 +69,7 @@ class Config:
     max_grad_norm: float = 1.0
     label_smoothing: float = 0.1
 
-    freeze_encoder_epochs: int = 10
+    freeze_encoder_epochs: int = 0
 
     curriculum_enabled: bool = True
     curriculum_simple_until: int = 15
@@ -151,14 +151,14 @@ def kaggle_offline_config(
     cfg.compile_model = True
 
     # --- LEARNING RATES & REGULARIZATION ---
-    cfg.encoder_lr = 1e-5     # Gentle on the pre-trained Swin features
+    cfg.encoder_lr = 2e-6     # Gentle on the pre-trained Swin features
     cfg.decoder_lr = 3e-4     
     cfg.weight_decay = 1e-4
     cfg.max_grad_norm = 1.0
     cfg.label_smoothing = 0.1
     
     # 15 epochs gives the decoder time to align with the massive encoder before unfreezing
-    cfg.freeze_encoder_epochs = 15
+    cfg.freeze_encoder_epochs = 0
 
     # --- TRAINING SCHEDULE ---
     cfg.num_epochs = 70
