@@ -56,7 +56,7 @@ def get_train_augmentation(height: int, width: int) -> A.Compose:
         ),
         
         # Simulating digital sensor noise
-        A.GaussNoise(var_limit=(10.0, 30.0), p=0.2),
+        A.GaussNoise(std_range=(10.0 / 255, 30.0 / 255), p=0.2),
     ])
 
 def get_val_augmentation() -> A.Compose:

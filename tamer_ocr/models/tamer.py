@@ -59,53 +59,28 @@ class TAMERModel(nn.Module):
     # Encoder Padding Mask
     # ------------------------------------------------------------------
 
-    def generate_memory_mask(
-        self,
-        real_ws: torch.Tensor,
-        real_hs: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Build a boolean encoder padding mask for cross-attention.
-
-        Args:
-            real_ws: (B,) int tensor — pixel width of content before padding
-            real_hs: (B,) int tensor — pixel height of content before padding
-            device:  target device
-
-        Returns:
-            mask: (B, feat_h * feat_w) bool tensor
-                  True  = padding token  → cross-attention will ignore it
-                  False = content token  → cross-attention will attend to it
-
-        Implementation note:
-            We use ceiling division so a partially-covered feature cell is
-            treated as valid (conservative: never mask real content).
-            The resulting 2D boolean grid is flattened row-major to match
-            the (B, L_mem, D) memory layout produced by SwinEncoder.
-        """
+    def generate_memory_mask(self, real_ws: torch.Tensor, real_hs: torch.Tensor, device: torch.device) -> torch.Tensor:
         B = real_ws.size(0)
         feat_h = self._feat_h
         feat_w = self._feat_w
 
-        # Start with everything masked (True = ignore everything)
-        mask = torch.ones((B, feat_h, feat_w), dtype=torch.bool, device=device)
+        # Use math instead of loops to find the boundaries
+        # This keeps the logic on the GPU and prevents Graph Breaks
+        valid_wf = ((real_ws.float() + self.DOWNSAMPLE_FACTOR - 1) / self.DOWNSAMPLE_FACTOR).long()
+        valid_hf = ((real_hs.float() + self.DOWNSAMPLE_FACTOR - 1) / self.DOWNSAMPLE_FACTOR).long()
+        
+        # Create coordinate grids
+        grid_y = torch.arange(feat_h, device=device).view(1, feat_h, 1).expand(B, feat_h, feat_w)
+        grid_x = torch.arange(feat_w, device=device).view(1, 1, feat_w).expand(B, feat_h, feat_w)
 
-        for i in range(B):
-            # Ceiling division: a cell partially covered by content is valid
-            valid_w = min(
-                feat_w,
-                (int(real_ws[i].item()) + self.DOWNSAMPLE_FACTOR - 1) // self.DOWNSAMPLE_FACTOR,
-            )
-            valid_h = min(
-                feat_h,
-                (int(real_hs[i].item()) + self.DOWNSAMPLE_FACTOR - 1) // self.DOWNSAMPLE_FACTOR,
-            )
-            # Mark the content region as False (do NOT ignore these tokens)
-            mask[i, :valid_h, :valid_w] = False
+        # Vectorized mask creation: True where coordinate is OUTSIDE real_w/real_h
+        mask = (grid_y >= valid_hf.view(B, 1, 1)) | (grid_x >= valid_wf.view(B, 1, 1))
+        
+        return mask.view(B, -1) # (B, L_mem)
 
-        # Flatten spatial dims to match encoder output: (B, feat_h*feat_w)
-        return mask.view(B, -1)
+
+
+
 
     # ------------------------------------------------------------------
     # encode() — called by both forward() and inference loops
