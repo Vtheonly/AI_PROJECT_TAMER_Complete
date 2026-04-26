@@ -3,10 +3,16 @@ LaTeX Tokenizer for Math OCR Training.
 
 Builds a global vocabulary from all datasets. Special tokens are fixed at indices 0-3.
 
-v2.4 Changes:
-  - FIXED: decode() now uses simple space-joining instead of complex smart-joining rules.
-    The previous "intelligent" parsing caused evaluation failures by producing
-    inconsistent output. Evaluation metrics (exact_match) handle normalization.
+v3.0 Changes:
+  - FIXED: STRUCTURAL_TOKENS now explicitly includes ^, _, {, }, [, ], (, )
+    so these critical math structure tokens are always in the vocabulary,
+    even if the corpus somehow misses them.
+  - FIXED: decode() now uses a smart joiner that removes spaces around
+    structural characters (^, _, {, }, etc.) and glues LaTeX commands to
+    their opening braces. This produces output like \frac{x}{y} and x^2
+    instead of \frac { x } { y } and x ^ 2, which is critical for
+    Matplotlib rendering during evaluation.
+  - tokenize() now also catches .,;! as single-character tokens.
 
 v2.3 Changes:
   - FIXED: \\\\ (double backslash / row separator) is now tokenized as a single
@@ -21,10 +27,11 @@ v2.3 Changes:
 """
 
 import logging
-from collections import Counter
-from typing import List, Dict, Optional
 import json
 import os
+import re
+from collections import Counter
+from typing import List, Dict
 
 logger = logging.getLogger("TAMER.Tokenizer")
 
@@ -39,10 +46,9 @@ class LaTeXTokenizer:
     UNK_TOKEN = '<unk>'
     SPECIAL_TOKENS = [PAD_TOKEN, SOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
 
-    # Structural tokens that MUST be in vocabulary for multi-line support
+    # FIX 1: Explicitly added subscripts, superscripts, and braces
     STRUCTURAL_TOKENS = [
-        '\\\\',              # row separator in matrices/aligned
-        '&',                 # column separator
+        '\\\\', '&', '^', '_', '{', '}', '[', ']', '(', ')'
     ]
 
     # Environment tokens — treated as atomic units
@@ -67,7 +73,7 @@ class LaTeXTokenizer:
         - LaTeX commands (\\frac, \\sqrt, etc.)
         - Escaped characters (\\{, \\}, etc.)
         - Individual digits and decimal points
-        - Structural symbols: { } ( ) [ ] + - = _ ^ & | < >
+        - Structural symbols: { } ( ) [ ] + - = _ ^ & | < > . , ; !
         """
         tokens = []
         i = 0
@@ -86,7 +92,7 @@ class LaTeXTokenizer:
             # Without this fix, \\\\ is parsed as two separate \\ commands,
             # which destroys matrix/aligned row structure.
             # ----------------------------------------------------------------
-            if i + 1 < n and latex[i] == '\\' and latex[i + 1] == '\\':
+            if i + 1 < n and latex[i:i+2] == '\\\\':
                 if i + 2 >= n or not latex[i + 2].isalpha():
                     tokens.append('\\\\')
                     i += 2
@@ -111,7 +117,7 @@ class LaTeXTokenizer:
                         # Full token: e.g., \\begin{matrix} or \\end{cases}
                         full_token = latex[i:k + 1]
                         # Normalize whitespace within: \\begin  {matrix} → \\begin{matrix}
-                        full_token = full_token[:cmd_len] + full_token[cmd_len:].lstrip()
+                        full_token = full_token[:cmd_len] + full_token[cmd_len:].replace(' ', '')
                         tokens.append(full_token)
                         i = k + 1
                         continue
@@ -125,22 +131,18 @@ class LaTeXTokenizer:
                     j += 1
                 if j == i + 1:
                     # Escaped special character like \{ \} \% \# or bare backslash
-                    if j < n:
-                        tokens.append(latex[i:j + 1])
-                        j += 1
-                    else:
-                        tokens.append(latex[i])
-                        j += 1
+                    tokens.append(latex[i:j + 1] if j < n else latex[i])
+                    i = j + 1
                 else:
                     # Regular command like \\frac or \\sqrt
                     tokens.append(latex[i:j])
-                i = j
+                    i = j
                 continue
 
             # ----------------------------------------------------------------
-            # Structural symbols — each is a single token
+            # FIX 2: Explicitly catch single structural characters
             # ----------------------------------------------------------------
-            if latex[i] in '{}()[]+-=_^&|<>':
+            if latex[i] in '{}()[]+-=_^&|<>.,;!':
                 tokens.append(latex[i])
                 i += 1
                 continue
@@ -201,14 +203,15 @@ class LaTeXTokenizer:
     def decode(self, indices: List[int], skip_special: bool = True) -> str:
         """
         Convert a list of integer indices back to a LaTeX string.
-        Safely joins tokens with a space. The evaluation metrics
-        (exact_match) handle stripping/normalizing spaces for final scoring.
+
+        FIX 3: Uses smart joining that removes spaces around structural
+        characters and glues commands to their braces, producing valid
+        LaTeX like \\frac{x}{y} and x^2 instead of \\frac { x } { y }
+        and x ^ 2. This is critical for Matplotlib rendering.
         """
         res = []
         for idx in indices:
-            idx_int = int(idx)
-            t = self.reverse_vocab.get(idx_int, self.UNK_TOKEN)
-
+            t = self.reverse_vocab.get(int(idx), self.UNK_TOKEN)
             if skip_special and t in self.SPECIAL_TOKENS:
                 continue
             if t == self.EOS_TOKEN:
@@ -218,13 +221,14 @@ class LaTeXTokenizer:
         if not res:
             return ""
 
-        # Just join with a space. It is mathematically safe and
-        # guarantees we don't accidentally merge commands like \alpha b
+        # FIX 3: Smart Joiner (Fixes Matplotlib rendering!)
         out = ' '.join(res)
+        # Remove spaces around mathematical structure tokens
+        out = re.sub(r'\s*([\^_\{\}\[\]\(\)])\s*', r'\1', out)
+        # Ensure commands like \frac have no space before the first brace
+        out = re.sub(r'(\\[a-zA-Z]+)\s+\{', r'\1{', out)
 
-        # Clean up any accidental double spaces
-        out = ' '.join(out.split())
-        return out
+        return ' '.join(out.split())
 
     def save(self, path: str):
         """Save vocabulary to a JSON file."""
