@@ -45,7 +45,8 @@ class Config:
     max_token_length: int = 150
     max_aspect_ratio: float = 10.0
 
-    encoder_name: str = "swinv2_base_window8_256.ms_in1k"
+    # 1. BASE CONFIG FIX: Ensure the architecture exactly matches the 22K checkpoint
+    encoder_name: str = "swinv2_base_window12_192.ms_in22k"
     encoder_feature_dim: int = 1024
     d_model: int = 768
     nhead: int = 12
@@ -143,6 +144,9 @@ def kaggle_offline_config(
     # 48 fits safely even with deep backpropagation graphs and compilation
     cfg.batch_size = 36 
     cfg.accumulation_steps = 6  # Effective batch size = 192
+    
+    # 2. KAGGLE OFFLINE FIX: Explicitly enforce the window12 architecture
+    cfg.encoder_name = "swinv2_base_window12_192.ms_in22k"
     
     cfg.num_workers = 10 # Utilize Kaggle CPU cores
     cfg.pin_memory = True

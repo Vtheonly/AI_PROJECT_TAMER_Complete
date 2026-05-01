@@ -102,12 +102,41 @@ class TrainerModelMixin:
         )
 
         # ── Scheduler ────────────────────────────────────────────────
-        # steps_per_epoch counts *optimizer* steps (after accumulation),
-        # not raw batch iterations.
-        steps_per_epoch = max(
-            math.ceil(len(self.train_loader) / self.config.accumulation_steps), 1
-        )
-        self.config.total_training_steps = steps_per_epoch * self.config.num_epochs
+        # Calculate exact optimizer steps across ALL curriculum epochs.
+        # Essential to prevent LR collapse when dataset size increases.
+        if getattr(self.config, "curriculum_enabled", False):
+            from ...data.latex_normalizer import get_complexity
+            simple_count = 0
+            medium_count = 0
+            complex_count = len(self.all_train_samples)
+            
+            for s in self.all_train_samples:
+                c = s.get("complexity") or get_complexity(s.get("latex", ""))
+                if c == "simple":
+                    simple_count += 1
+                    medium_count += 1
+                elif c == "medium":
+                    medium_count += 1
+                    
+            total_steps = 0
+            for ep in range(1, self.config.num_epochs + 1):
+                stage = self._get_curriculum_stage(ep)
+                if stage == "simple":
+                    stage_samples = simple_count
+                elif stage == "medium":
+                    stage_samples = medium_count
+                else:
+                    stage_samples = complex_count
+                
+                stage_batches = stage_samples // self.config.batch_size
+                stage_steps = max(math.ceil(stage_batches / self.config.accumulation_steps), 1)
+                total_steps += stage_steps
+                
+            self.config.total_training_steps = total_steps
+            self.logger.info(f"Curriculum exact total steps: {total_steps:,}")
+        else:
+            steps_per_epoch = max(math.ceil(len(self.train_loader) / self.config.accumulation_steps), 1)
+            self.config.total_training_steps = steps_per_epoch * self.config.num_epochs
 
         self.scheduler = OneCycleLR(
             self.optimizer,
@@ -123,7 +152,4 @@ class TrainerModelMixin:
             f"Encoder LR  : {self.config.encoder_lr:.1e} | "
             f"Decoder LR  : {self.config.decoder_lr:.1e}"
         )
-        self.logger.info(
-            f"Steps/epoch : {steps_per_epoch} | "
-            f"Total steps : {self.config.total_training_steps:,}"
-        )
+        self.logger.info(f"Total steps : {self.config.total_training_steps:,}")
